@@ -51,3 +51,7 @@ The server is purely an **ephemeral signaling broker**: short-polled PHP flat-fi
 - Same-network only by design: signaling uses public STUN (no TURN), so no server relay exists by choice.
 - `sessions/ip_ratelimit.json` holds the brute-force counters; delete it server-side to instantly clear a lockout (entries otherwise expire automatically).
 - Client assets are cache-busted (`?v=N` + versioned service-worker cache); footer shows the running build (`vN`) for support.
+
+## Credit
+
+- Created by [No Drama Digital](https://nodrama.au) - Websites without the drama.
