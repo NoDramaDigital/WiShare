@@ -1,5 +1,5 @@
 (function () {
-  var APP_VER = 'v22';
+  var APP_VER = 'v39';
   var APP_BUILD = 1;
   function paintDims() {
     try {
@@ -254,6 +254,7 @@
       }
       currentPin = res.pin;
       currentRole = 'host';
+      clearWorkspace();
       var pinEl = $('host-pin');
       if (pinEl) pinEl.textContent = String(currentPin).split('').join(' ');
       show('view-host');
@@ -387,6 +388,7 @@
       sessionToken++;
       currentPin = code;
       currentRole = 'joiner';
+      clearWorkspace();
       stopHostCountdown();
       show('view-app');
       bindWorkspaceOnce();
@@ -398,6 +400,8 @@
       try {
         await P2P.joinSession(code);
       } catch (e) {
+        stopSessionGuard();
+        releaseWakeLock();
         show('view-join');
         clearPinBoxes();
         currentPin = null;
@@ -574,30 +578,131 @@
     list.prepend(card);
   }
 
+  var txRows = Object.create(null);
+  var rxRows = Object.create(null);
+
+  function progressRow(listId, key) {
+    var list = $(listId);
+    if (!list) return null;
+    var row = list.querySelector('[data-tid="' + key + '"]');
+    if (row) return row;
+    row = document.createElement('div');
+    row.setAttribute('data-tid', key);
+    row.className = 'txrx-row';
+    var top = document.createElement('div');
+    top.className = 'txrx-top';
+    var nm = document.createElement('span');
+    nm.className = 'txrx-name';
+    var pc = document.createElement('span');
+    pc.className = 'txrx-pct';
+    var xc = document.createElement('button');
+    xc.className = 'txrx-cancel';
+    xc.textContent = '\u2715';
+    xc.setAttribute('aria-label', 'Cancel transfer');
+    xc.title = 'Cancel transfer';
+    (function (btn, lid, tid) {
+      btn.addEventListener('click', function () {
+        try { if (window.P2P) P2P.cancelTransfer(tid); } catch (e) {}
+        if (lid === 'tx-list') { dropRow(lid, txRows, tid, false); delete txState[tid]; }
+        else { dropRow(lid, rxRows, tid, false); delete rxState[tid]; }
+      });
+    })(xc, listId, key);
+    top.appendChild(nm);
+    top.appendChild(pc);
+    top.appendChild(xc);
+    var track = document.createElement('div');
+    track.className = 'progress-track h-6 rounded-xl bg-slate-100 dark:bg-slate-800';
+    var fill = document.createElement('div');
+    fill.className = 'progress-fill';
+    fill.style.transform = 'scaleX(0)';
+    fill.setAttribute('role', 'progressbar');
+    fill.setAttribute('aria-valuemin', '0');
+    fill.setAttribute('aria-valuemax', '100');
+    fill.setAttribute('aria-valuenow', '0');
+    track.appendChild(fill);
+    var meta = document.createElement('div');
+    meta.className = 'txrx-meta';
+    row.appendChild(top);
+    row.appendChild(track);
+    row.appendChild(meta);
+    list.appendChild(row);
+    return row;
+  }
+
+  function dropRow(listId, rows, key, done) {
+    var list = $(listId);
+    var row = rows[key];
+    if (row && list && row.parentNode === list) {
+      if (done) {
+        var fill = row.querySelector('.progress-fill');
+        if (fill) { fill.style.transform = 'scaleX(1)'; fill.setAttribute('aria-valuenow', '100'); }
+        var rl = row;
+        setTimeout(function () {
+          if (rl.parentNode === list) list.removeChild(rl);
+          if (list.children.length === 0) {
+            var wrap = list.closest('.card');
+            if (wrap) wrap.classList.add('hidden');
+          }
+        }, 2500);
+      } else {
+        list.removeChild(row);
+      }
+    }
+    delete rows[key];
+    if (!done && list && list.children.length === 0) {
+      var wrap = list.closest('.card');
+      if (wrap) wrap.classList.add('hidden');
+    }
+  }
+
   function renderTx(st) {
     var wrap = $('tx-wrap');
-    var bar = $('tx-bar');
-    var meta = $('tx-meta');
-    if (!wrap || !bar || !meta) return;
-    if (!st) { wrap.classList.add('hidden'); return; }
+    if (!wrap) return;
+    if (!st) {
+      var tl = $('tx-list');
+      if (tl) while (tl.firstChild) tl.removeChild(tl.firstChild);
+      txRows = Object.create(null);
+      wrap.classList.add('hidden');
+      return;
+    }
     wrap.classList.remove('hidden');
+    var row = progressRow('tx-list', st.transferId);
+    if (!row) return;
+    txRows[st.transferId] = row;
     var pct = st.size > 0 ? Math.round((st.sent / st.size) * 100) : 100;
-    bar.style.width = pct + '%';
-    bar.textContent = pct + '%';
-    meta.textContent = st.name + ' · ' + fmtBytes(st.sent) + ' / ' + fmtBytes(st.size) + ' · ' + st.elapsed.toFixed(1) + 's · ' + fmtRate(st.rate);
+    row.querySelector('.txrx-name').textContent = st.name;
+    row.querySelector('.txrx-name').title = st.name;
+    row.querySelector('.txrx-pct').textContent = pct + '%';
+    var fill = row.querySelector('.progress-fill');
+    fill.classList.add('progress-send');
+    fill.style.transform = 'scaleX(' + (pct / 100) + ')';
+    fill.setAttribute('aria-valuenow', String(pct));
+    row.querySelector('.txrx-meta').textContent = fmtBytes(st.sent) + ' / ' + fmtBytes(st.size) + ' · ' + st.elapsed.toFixed(1) + 's · ' + fmtRate(st.rate);
   }
 
   function renderRx(st) {
     var wrap = $('rx-wrap');
-    var bar = $('rx-bar');
-    var meta = $('rx-meta');
-    if (!wrap || !bar || !meta) return;
-    if (!st) { wrap.classList.add('hidden'); return; }
+    if (!wrap) return;
+    if (!st) {
+      var rl = $('rx-list');
+      if (rl) while (rl.firstChild) rl.removeChild(rl.firstChild);
+      rxRows = Object.create(null);
+      wrap.classList.add('hidden');
+      return;
+    }
     wrap.classList.remove('hidden');
+    var row = progressRow('rx-list', st.transferId);
+    if (!row) return;
+    rxRows[st.transferId] = row;
     var pct = st.size > 0 ? Math.round((st.received / st.size) * 100) : 100;
-    bar.style.width = pct + '%';
-    bar.textContent = pct + '%';
-    meta.textContent = st.name + ' · ' + fmtBytes(st.received) + ' / ' + fmtBytes(st.size) + ' · ' + st.elapsed.toFixed(1) + 's · ' + fmtRate(st.rate);
+    row.querySelector('.txrx-name').textContent = st.name;
+    row.querySelector('.txrx-name').title = st.name;
+    row.querySelector('.txrx-pct').textContent = pct + '%';
+    var fill = row.querySelector('.progress-fill');
+    fill.classList.add('progress-recv');
+    fill.style.transform = 'scaleX(' + (pct / 100) + ')';
+    fill.setAttribute('aria-valuenow', String(pct));
+    row.querySelector('.txrx-meta').textContent = fmtBytes(st.received) + ' / ' + fmtBytes(st.size) + ' · ' + st.elapsed.toFixed(1) + 's · ' + fmtRate(st.rate);
   }
 
   function updateZipButton() {
@@ -767,8 +872,7 @@
       renderTx(evt.data);
       maybeExpireSession();
     } else if (evt.type === 'send-done') {
-      renderTx(null);
-      delete txState[evt.data.transferId];
+      dropRow('tx-list', txRows, evt.data.transferId, true);
       toast('Sent ' + evt.data.name);
       maybeExpireSession();
     } else if (evt.type === 'recv-start') {
@@ -778,7 +882,7 @@
       rxState[evt.data.transferId] = evt.data;
       renderRx(evt.data);
     } else if (evt.type === 'file-received') {
-      renderRx(null);
+      dropRow('rx-list', rxRows, evt.data.transferId, true);
       delete rxState[evt.data.transferId];
       appendFileCard(evt.data);
       playIncoming();
@@ -790,11 +894,22 @@
         }
       } catch (e) {}
       maybeExpireSession();
+    } else if (evt.type === 'peer-received') {
+      var confirmed = txState[evt.data.transferId];
+      toast('\u2713 Peer saved ' + (confirmed ? confirmed.name : 'file'));
+      delete txState[evt.data.transferId];
     } else if (evt.type === 'text-received') {
       appendTextCard(evt.data.text, false);
       playIncoming();
     } else if (evt.type === 'extend-received') {
       extendSession(true);
+    } else if (evt.type === 'recv-aborted') {
+      dropRow('rx-list', rxRows, evt.data.transferId, false);
+      delete rxState[evt.data.transferId];
+    } else if (evt.type === 'recv-stalled') {
+      dropRow('rx-list', rxRows, evt.data.transferId, false);
+      delete rxState[evt.data.transferId];
+      toast('Stalled: ' + (evt.data.name || 'file') + ' — sender may have disconnected');
     } else if (evt.type === 'teardown') {
       endSession(true);
       toast('Peer ended session');
@@ -802,7 +917,31 @@
       setConnected(false);
     } else if (evt.type === 'error') {
       if (evt.data.message === 'not_connected') toast('Not connected yet');
-      if (evt.data.message === 'send_failed') toast('Send failed — check connection');
+      if (evt.data.message === 'send_failed') {
+        dropRow('tx-list', txRows, evt.data.transferId, false);
+        delete txState[evt.data.transferId];
+        toast('Send failed — check connection');
+      }
+      if (evt.data.message === 'send-cancelled') {
+        dropRow('tx-list', txRows, evt.data.transferId, false);
+        delete txState[evt.data.transferId];
+        if (evt.data.remote) toast('Transfer cancelled by peer');
+      }
+      if (evt.data.message === 'send-stalled') {
+        dropRow('tx-list', txRows, evt.data.transferId, false);
+        delete txState[evt.data.transferId];
+        toast('Retrying ' + (evt.data.name || 'file') + ' with smaller chunks');
+      }
+      if (evt.data.message === 'corrupt') {
+        dropRow('rx-list', rxRows, evt.data.transferId, false);
+        delete rxState[evt.data.transferId];
+        toast('File corrupted in transit — please resend');
+      }
+      if (evt.data.message === 'assemble_failed') {
+        dropRow('rx-list', rxRows, evt.data.transferId, false);
+        delete rxState[evt.data.transferId];
+        toast('Could not assemble file — too large for this device?');
+      }
     }
   }
 
@@ -827,6 +966,20 @@
     list.appendChild(p);
   }
 
+  function clearWorkspace() {
+    txState = Object.create(null);
+    rxState = Object.create(null);
+    txRows = Object.create(null);
+    rxRows = Object.create(null);
+    receivedBlobs = [];
+    updateZipButton();
+    renderTx(null);
+    renderRx(null);
+    clearList('text-list', 'text-empty', 'Incoming text appears here.');
+    clearList('file-list', 'file-empty', 'Received files appear here — tap Download explicitly on Android.');
+    setTextExpanded(false);
+  }
+
   async function endSession(silent) {
     sessionToken++;
     if (debugTimer) {
@@ -842,15 +995,7 @@
     if (currentPin) await apiCleanup(currentPin);
     currentPin = null;
     currentRole = null;
-    txState = Object.create(null);
-    rxState = Object.create(null);
-    receivedBlobs = [];
-    updateZipButton();
-    setTextExpanded(false);
-    renderTx(null);
-    renderRx(null);
-    clearList('text-list', 'text-empty', 'Incoming text appears here.');
-    clearList('file-list', 'file-empty', 'Received files appear here — tap Download explicitly on Android.');
+    clearWorkspace();
     lastJoinCode = null;
     try {
       var defaultTab = $('btn-tab-text');
@@ -905,7 +1050,7 @@
     try {
       var d = window.P2P ? P2P.debug() : null;
       line.textContent = d
-        ? 'ice:' + d.ice + ' conn:' + d.conn + ' dc:' + d.dc + ' sig:' + d.sig + ' fails:' + d.fails + ' cands:' + d.sentCands + '↑/' + d.gotCands + '↓'
+        ? 'ice:' + d.ice + ' conn:' + d.conn + ' dc:' + d.dc + ' sig:' + d.sig + ' fails:' + d.fails + ' cands:' + d.sentCands + '↑/' + d.gotCands + '↓' + ' loop:' + d.loopMs + 'ms max:' + d.maxMsg + ' rtt:' + d.rtt + 'ms'
         : 'engine missing';
     } catch (e) {
       line.textContent = 'n/a';
