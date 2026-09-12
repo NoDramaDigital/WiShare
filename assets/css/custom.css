@@ -2,6 +2,14 @@
 html, body { -webkit-tap-highlight-color: transparent; }
 body { text-rendering: optimizeLegibility; }
 
+.hidden { display: none !important; }
+.flex { display: flex; }
+.grid { display: grid; }
+.flex-col { flex-direction: column; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.w-full { width: 100%; }
+
 .bg-decor {
   background-color: rgb(248 250 252);
   background-image:
@@ -212,11 +220,27 @@ body { text-rendering: optimizeLegibility; }
   transform: scale(1.01);
 }
 .progress-track { overflow: hidden; }
+.txrx-list { display: grid; gap: .45rem; max-height: 18rem; overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(148, 163, 184, .55) transparent; scrollbar-gutter: stable; padding-right: .25rem; }
+.txrx-list::-webkit-scrollbar { width: 6px; }
+.txrx-list::-webkit-scrollbar-track { background: transparent; }
+.txrx-list::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, .55); border-radius: 999px; }
+.txrx-row { display: grid; gap: .2rem; }
+.txrx-top { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; font-size: .72rem; }
+.txrx-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.txrx-pct { font-family: ui-monospace, monospace; font-weight: 800; flex-shrink: 0; }
+.txrx-cancel { flex-shrink: 0; font-size: .7rem; font-weight: 800; padding: .1rem .45rem; border-radius: .5rem; opacity: .45; transition: opacity .15s ease, background .15s ease, color .15s ease; }
+.txrx-cancel:hover { opacity: 1; background: rgba(239, 68, 68, .12); color: rgb(220 38 38); }
+@media (max-width: 899px) {
+  .txrx-cancel { opacity: .9; font-size: .85rem; padding: .35rem .6rem; }
+}
+.txrx-meta { font-size: 11px; font-family: ui-monospace, monospace; opacity: .7; }
+.txrx-row .progress-track { height: 1.1rem; }
 .progress-fill {
   height: 100%; border-radius: .75rem; color: #fff;
   font-size: .7rem; font-weight: 800;
   display: flex; align-items: center; justify-content: center;
-  transition: width .2s linear; min-width: 2.5em;
+  transition: transform .15s linear; min-width: 2.5em;
+  transform: scaleX(0); transform-origin: left center;
   background-size: 1rem 1rem;
 }
 .progress-send { background-color: #10b981; background-image: linear-gradient(45deg, rgba(255,255,255,.2) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.2) 50%, rgba(255,255,255,.2) 75%, transparent 75%); animation: stripes .8s linear infinite; }
