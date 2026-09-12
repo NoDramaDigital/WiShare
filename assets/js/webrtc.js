@@ -7,10 +7,11 @@ window.P2P = (function () {
     iceCandidatePoolSize: 10
   };
   var CHUNK_SIZE = 65536;
-  var LOW_THRESHOLD = 1048576;
-  var HIGH_WATER = 8388608;
+  var LOW_THRESHOLD = 524288;
+  var HIGH_WATER = 2097152;
   var POLL_MS = 1100;
   var RECONNECT_WINDOW_MS = 30000;
+  var PROTO_VER = 1;
 
   var pc = null;
   var dc = null;
@@ -24,7 +25,12 @@ window.P2P = (function () {
   var appliedAnswerSdp = null;
   var handlers = [];
   var sendQueue = [];
-  var sending = false;
+  var activeCount = 0;
+  var fileSlots = [];
+  var FILE_SLOTS = 3;
+  var activeSends = {};
+  var peerNew = false;
+  var dcPseudo = { ch: null, open: false, busy: false, transferId: null };
   var incoming = Object.create(null);
   var connectedFlag = false;
   var reconnectTimer = null;
@@ -36,6 +42,11 @@ window.P2P = (function () {
   var failCount = 0;
   var signalGone = false;
   var statSentCands = 0;
+  var lastRtt = 0;
+  var pingTimer = null;
+  var lastSendEmit = 0;
+  var loopSum = 0;
+  var loopN = 0;
 
   function emit(type, payload) {
     var evt = { type: type, data: payload || {} };
@@ -69,9 +80,19 @@ window.P2P = (function () {
 
   async function pollOnce() {
     if (pollActive || closed || !pc || !pin || !role) return;
+    try {
+      var sweepNow = Date.now();
+      for (var tid in incoming) {
+        var ent = incoming[tid];
+        if (ent && sweepNow - (ent.lastProgress || ent.startedAt || 0) > 30000) {
+          delete incoming[tid];
+          emit('recv-stalled', { transferId: tid, name: ent.meta ? ent.meta.name : 'file' });
+        }
+      }
+    } catch (sweepErr) {}
     pollActive = true;
     try {
-      var out = { role: role };
+      var out = { role: role, cv: PROTO_VER };
       if (unsentCandidates.length > 0) {
         out.candidates = unsentCandidates.slice();
       }
@@ -115,6 +136,21 @@ window.P2P = (function () {
     }
   }
 
+  var CRC_TABLE = null;
+  function crc32Update(crc, bytes) {
+    if (!CRC_TABLE) {
+      var t = new Array(256);
+      for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[n] = c;
+      }
+      CRC_TABLE = t;
+    }
+    for (var i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    return crc;
+  }
+
   function hashStr(s) {
     var h = 0;
     for (var i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
@@ -123,6 +159,7 @@ window.P2P = (function () {
 
   async function applyRemoteState(state) {
     if (closed) return;
+    if (state && typeof state.peer_cv === 'number' && state.peer_cv >= 1) peerNew = true;
     try {
       if (role === 'host' && state.answer && state.answer.sdp !== appliedAnswerSdp) {
         if (!pc.currentRemoteDescription || pc.currentRemoteDescription.sdp !== state.answer.sdp) {
@@ -212,9 +249,17 @@ window.P2P = (function () {
     try { ch.bufferedAmountLowThreshold = LOW_THRESHOLD; } catch (e) {}
     ch.onopen = function () {
       emit('channel-open', {});
+      startPing();
+      dispatchQueue();
     };
     ch.onclose = function () {
       emit('channel-close', {});
+      stopPing();
+      if (ch._resumeSend) {
+        var r = ch._resumeSend;
+        ch._resumeSend = null;
+        try { r(); } catch (e) {}
+      }
     };
     ch.onerror = function () {
       emit('error', { message: 'datachannel_error' });
@@ -226,7 +271,45 @@ window.P2P = (function () {
         r();
       }
     };
-    ch.onmessage = handleMessage;
+    ch.onmessage = function (e) { handleMessage(e, ch); };
+  }
+
+  function slotByChannel(ch) {
+    for (var i = 0; i < fileSlots.length; i++) {
+      if (fileSlots[i] && fileSlots[i].ch === ch) return fileSlots[i];
+    }
+    return null;
+  }
+
+  function wireFileChannel(ch, idx) {
+    ch.binaryType = 'arraybuffer';
+    try { ch.bufferedAmountLowThreshold = LOW_THRESHOLD; } catch (e) {}
+    ch.onopen = function () {
+      var slot = slotByChannel(ch);
+      if (slot) slot.open = true;
+      dispatchQueue();
+    };
+    ch.onclose = function () {
+      var slot = slotByChannel(ch);
+      if (slot) { slot.open = false; slot.busy = false; }
+      if (ch._resumeSend) {
+        var r = ch._resumeSend;
+        ch._resumeSend = null;
+        try { r(); } catch (e) {}
+      }
+    };
+    ch.onerror = function () {
+      emit('error', { message: 'datachannel_error' });
+    };
+    ch.onbufferedamountlow = function () {
+      if (ch._resumeSend) {
+        var r = ch._resumeSend;
+        ch._resumeSend = null;
+        r();
+      }
+    };
+    ch.onmessage = function (e) { handleMessage(e, ch); };
+    fileSlots[idx] = { ch: ch, open: ch.readyState === 'open', busy: false, transferId: null };
   }
 
   function waitForDrain(ch) {
@@ -234,6 +317,16 @@ window.P2P = (function () {
       if (ch.bufferedAmount <= LOW_THRESHOLD) return resolve();
       ch._resumeSend = resolve;
     });
+  }
+
+  function settleWaiter(ch) {
+    try {
+      if (ch && ch._resumeSend) {
+        var r = ch._resumeSend;
+        ch._resumeSend = null;
+        r();
+      }
+    } catch (e) {}
   }
 
   function pruneWindow(arr, now) {
@@ -247,24 +340,29 @@ window.P2P = (function () {
     return b;
   }
 
-  async function handleMessage(e) {
+  async function handleMessage(e, ch) {
     var now = Date.now();
     if (typeof e.data === 'string') {
       var msg;
       try { msg = JSON.parse(e.data); } catch (err) { return; }
       if (msg.type === 'meta' && msg.kind === 'file') {
-        if (typeof msg.transferId !== 'string' || msg.transferId === '' || msg.transferId.length > 80) return;
+        if (typeof msg.transferId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(msg.transferId)) return;
         if (typeof msg.size !== 'number' || !(msg.size >= 0) || msg.size > 21474836480) return;
         if (typeof msg.totalChunks !== 'number' || (msg.totalChunks | 0) !== msg.totalChunks) return;
         if (typeof msg.name !== 'string' || msg.name === '' || msg.name.length > 255) return;
-        var expect = Math.max(1, Math.ceil(msg.size / CHUNK_SIZE));
+        var cs = CHUNK_SIZE;
+        if (typeof msg.chunkSize === 'number' && (msg.chunkSize | 0) === msg.chunkSize && msg.chunkSize >= 4096 && msg.chunkSize <= 1048576) cs = msg.chunkSize;
+        var expect = Math.max(1, Math.ceil(msg.size / cs));
         if (msg.totalChunks !== expect || msg.totalChunks > 350000) return;
+        if (ch) ch._transferId = msg.transferId;
         incoming[msg.transferId] = {
           meta: msg,
           chunks: new Array(msg.totalChunks),
           received: 0,
           receivedBytes: 0,
-          startedAt: now
+          startedAt: now,
+          lastEmit: 0,
+          lastProgress: now
         };
         emit('recv-start', { transferId: msg.transferId, name: msg.name, size: msg.size, mime: msg.mime, totalChunks: msg.totalChunks });
       } else if (msg.type === 'eof') {
@@ -272,6 +370,22 @@ window.P2P = (function () {
         if (!inc) return;
         for (var k = 0; k < inc.chunks.length; k++) {
           if (!inc.chunks[k]) inc.chunks[k] = new ArrayBuffer(0);
+          else if (typeof Blob !== 'undefined' && inc.chunks[k] instanceof Blob) {
+            try { inc.chunks[k] = await inc.chunks[k].arrayBuffer(); }
+            catch (convErr) { inc.chunks[k] = new ArrayBuffer(0); }
+          }
+        }
+        if (typeof msg.crc === 'number') {
+          var check = 0xFFFFFFFF;
+          for (var j = 0; j < inc.chunks.length; j++) {
+            check = crc32Update(check, new Uint8Array(inc.chunks[j]));
+          }
+          check = (check ^ 0xFFFFFFFF) >>> 0;
+          if (check !== (msg.crc >>> 0)) {
+            delete incoming[msg.transferId];
+            emit('error', { message: 'corrupt', name: inc.meta.name, transferId: msg.transferId });
+            return;
+          }
         }
         try {
           var blob = new Blob(inc.chunks, { type: inc.meta.mime || 'application/octet-stream' });
@@ -284,15 +398,36 @@ window.P2P = (function () {
             url: url,
             blob: blob
           });
+          try {
+            var ackCh = (ch && ch.readyState === 'open') ? ch : null;
+            if (!ackCh && dc && dc.readyState === 'open') ackCh = dc;
+            if (ackCh) ackCh.send(JSON.stringify({ type: 'received', transferId: msg.transferId }));
+          } catch (ackErr) {}
         } catch (err) {
-          emit('error', { message: 'assemble_failed' });
+          emit('error', { message: 'assemble_failed', transferId: msg.transferId });
         }
         delete incoming[msg.transferId];
+        if (ch) ch._transferId = null;
       } else if (msg.type === 'text') {
         emit('text-received', { transferId: msg.transferId, text: msg.text || '', ts: msg.ts || Date.now() });
       } else if (msg.type === 'extend') {
         var mins = (typeof msg.minutes === 'number' && msg.minutes > 0 && msg.minutes <= 30) ? msg.minutes : 5;
         emit('extend-received', { minutes: mins });
+      } else if (msg.type === 'ping' && typeof msg.t === 'number') {
+        try { dc.send(JSON.stringify({ type: 'pong', t: msg.t })); } catch (e) {}
+      } else if (msg.type === 'pong' && typeof msg.t === 'number') {
+        var rtt = Date.now() - msg.t;
+        if (rtt >= 0 && rtt < 60000) lastRtt = rtt;
+      } else if (msg.type === 'received' && typeof msg.transferId === 'string') {
+        emit('peer-received', { transferId: msg.transferId });
+      } else if (msg.type === 'abort' && typeof msg.transferId === 'string') {
+        if (activeSends[msg.transferId]) {
+          activeSends[msg.transferId].item.cancelled = 'remote';
+          settleWaiter(activeSends[msg.transferId].ch);
+        } else if (incoming[msg.transferId]) {
+          delete incoming[msg.transferId];
+          emit('recv-aborted', { transferId: msg.transferId });
+        }
       } else if (msg.type === 'teardown') {
         emit('teardown', {});
         await disconnect(false);
@@ -300,11 +435,15 @@ window.P2P = (function () {
       return;
     }
     var buf = e.data;
-    var byteLen = buf ? buf.byteLength : 0;
+    var byteLen = buf ? (buf.byteLength || buf.size || 0) : 0;
     bytesRecvWindow.push({ t: now, n: byteLen });
     var targetId = null;
-    for (var id in incoming) {
-      if (incoming[id].received < incoming[id].meta.totalChunks) { targetId = id; break; }
+    if (ch && ch._transferId && incoming[ch._transferId] && incoming[ch._transferId].received < incoming[ch._transferId].meta.totalChunks) {
+      targetId = ch._transferId;
+    } else {
+      for (var id in incoming) {
+        if (incoming[id].received < incoming[id].meta.totalChunks) { targetId = id; break; }
+      }
     }
     if (!targetId) return;
     var rec = incoming[targetId];
@@ -312,16 +451,21 @@ window.P2P = (function () {
     rec.chunks[rec.received] = buf;
     rec.received++;
     rec.receivedBytes += byteLen;
-    emit('recv-progress', {
-      transferId: targetId,
-      name: rec.meta.name,
-      received: rec.receivedBytes,
-      size: rec.meta.size,
-      chunks: rec.received,
-      totalChunks: rec.meta.totalChunks,
-      rate: windowRate(bytesRecvWindow, Date.now()),
-      elapsed: (Date.now() - rec.startedAt) / 1000
-    });
+    rec.lastProgress = Date.now();
+    var rnow = Date.now();
+    if (rnow - rec.lastEmit >= 100 || rec.received >= rec.meta.totalChunks) {
+      rec.lastEmit = rnow;
+      emit('recv-progress', {
+        transferId: targetId,
+        name: rec.meta.name,
+        received: rec.receivedBytes,
+        size: rec.meta.size,
+        chunks: rec.received,
+        totalChunks: rec.meta.totalChunks,
+        rate: windowRate(bytesRecvWindow, rnow),
+        elapsed: (rnow - rec.startedAt) / 1000
+      });
+    }
   }
 
   async function handleDisconnect() {
@@ -346,6 +490,19 @@ window.P2P = (function () {
     }, RECONNECT_WINDOW_MS);
   }
 
+  function startPing() {
+    stopPing();
+    pingTimer = setInterval(function () {
+      if (closed || !dc || dc.readyState !== 'open') return;
+      try { dc.send(JSON.stringify({ type: 'ping', t: Date.now() })); } catch (e) {}
+    }, 2000);
+  }
+
+  function stopPing() {
+    if (pingTimer) clearInterval(pingTimer);
+    pingTimer = null;
+  }
+
   function clearReconnectTimer() {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -354,14 +511,17 @@ window.P2P = (function () {
   function reset() {
     stopPolling();
     clearReconnectTimer();
-    try {
-      if (dc && dc._resumeSend) {
-        var pending = dc._resumeSend;
-        dc._resumeSend = null;
-        pending();
-      }
-    } catch (e) {}
+    stopPing();
+    settleWaiter(dc);
+    for (var ri = 0; ri < fileSlots.length; ri++) {
+      if (fileSlots[ri]) settleWaiter(fileSlots[ri].ch);
+    }
+    lastRtt = 0;
     try { if (dc) dc.close(); } catch (e) {}
+    for (var si = 0; si < fileSlots.length; si++) {
+      try { if (fileSlots[si] && fileSlots[si].ch) fileSlots[si].ch.close(); } catch (e) {}
+    }
+    fileSlots = [];
     try { if (pc) pc.close(); } catch (e) {}
     pc = null;
     dc = null;
@@ -370,14 +530,19 @@ window.P2P = (function () {
     appliedOfferSdp = null;
     appliedAnswerSdp = null;
     sendQueue = [];
-    sending = false;
+    activeCount = 0;
+    activeSends = {};
     incoming = Object.create(null);
     connectedFlag = false;
     lastOfferSent = null;
     lastAnswerSent = null;
     failCount = 0;
     signalGone = false;
+    peerNew = false;
     statSentCands = 0;
+    lastSendEmit = 0;
+    loopSum = 0;
+    loopN = 0;
     bytesSentWindow = [];
     bytesRecvWindow = [];
     closed = false;
@@ -391,6 +556,9 @@ window.P2P = (function () {
     wireConnectionEvents();
     dc = pc.createDataChannel('transferChannel', { ordered: true });
     wireChannel(dc);
+    for (var fi = 0; fi < FILE_SLOTS; fi++) {
+      wireFileChannel(pc.createDataChannel('file-' + fi, { ordered: true }), fi);
+    }
     var offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     startPolling();
@@ -404,6 +572,14 @@ window.P2P = (function () {
     pc = new RTCPeerConnection(rtcConfig);
     wireConnectionEvents();
     pc.ondatachannel = function (e) {
+      var label = (e.channel && e.channel.label) || '';
+      if (label.indexOf('file-') === 0) {
+        var idx = parseInt(label.slice(5), 10);
+        if (idx >= 0 && idx < FILE_SLOTS) {
+          wireFileChannel(e.channel, idx);
+          return;
+        }
+      }
       dc = e.channel;
       wireChannel(dc);
     };
@@ -411,27 +587,106 @@ window.P2P = (function () {
     return true;
   }
 
-  async function processQueue() {
-    if (sending || sendQueue.length === 0 || !dc) return;
-    sending = true;
-    while (sendQueue.length > 0) {
-      if (closed || !dc || dc.readyState !== 'open') break;
-      var item = sendQueue[0];
-      try {
-        await sendOneFile(item);
-      } catch (e) {
-        if (!closed) emit('error', { message: 'send_failed', name: item.file.name });
+  function freeSlot() {
+    if (!peerNew) {
+      if (dc && dc.readyState === 'open' && !dcPseudo.busy) {
+        dcPseudo.ch = dc;
+        dcPseudo.open = true;
+        return dcPseudo;
       }
-      sendQueue.shift();
+      return null;
     }
-    sending = false;
-    emit('queue-drained', {});
+    var fallback = null;
+    for (var i = 0; i < fileSlots.length; i++) {
+      var slot = fileSlots[i];
+      if (slot && slot.open && !slot.busy) {
+        if (!slot.stalls) return slot;
+        if (!fallback) fallback = slot;
+      }
+    }
+    if (fallback) return fallback;
+    if (fileSlots.length === 0 && dc && dc.readyState === 'open' && !dcPseudo.busy) {
+      dcPseudo.ch = dc;
+      dcPseudo.open = true;
+      return dcPseudo;
+    }
+    return null;
   }
 
-  async function sendOneFile(item) {
+  function dispatchQueue() {
+    if (closed || !dc) return;
+    if (dc.readyState !== 'open') return;
+    var slot = freeSlot();
+    while (sendQueue.length > 0 && slot) {
+      if (closed) break;
+      var item = sendQueue.shift();
+      slot.busy = true;
+      slot.transferId = item.transferId;
+      activeSends[item.transferId] = { item: item, ch: slot.ch };
+      activeCount++;
+      (function (it, sl) {
+        sendOneFile(it, sl.ch).then(function () {
+          activeCount = Math.max(0, activeCount - 1);
+        }).catch(function (err) {
+          activeCount = Math.max(0, activeCount - 1);
+          if (err && err.message === 'cancelled') {
+            if (closed) { /* session torn down: quiet */ }
+            else {
+              sendAbort(it.transferId);
+              emit('error', { message: 'send-cancelled', name: it.file.name, transferId: it.transferId, remote: !!(err && err.remote) });
+            }
+          } else if (!closed && err && err.message === 'stalled' && (it.retries | 0) < 2) {
+            sl.stalls = (sl.stalls | 0) + 1;
+            sendAbort(it.transferId);
+            sendQueue.unshift({ file: it.file, transferId: uuid(), forceCs: 16384, retries: (it.retries | 0) + 1 });
+            emit('error', { message: 'send-stalled', name: it.file.name, transferId: it.transferId });
+          } else if (!closed) {
+            emit('error', { message: 'send_failed', name: it.file.name, transferId: it.transferId, detail: (err && err.message) || 'unknown' });
+          }
+        }).then(function () {
+          delete activeSends[it.transferId];
+          sl.busy = false;
+          sl.transferId = null;
+          if (sendQueue.length === 0 && activeCount === 0) emit('queue-drained', {});
+          dispatchQueue();
+        });
+      })(item, slot);
+      slot = freeSlot();
+    }
+  }
+
+  function processQueue() {
+    dispatchQueue();
+  }
+
+  function pickChunkSize(force) {
+    if (typeof force === 'number' && (force | 0) === force && force >= 4096 && force <= 1048576) return force;
+    if (!peerNew) return CHUNK_SIZE;
+    try {
+      var m = pc && pc.sctp ? pc.sctp.maxMessageSize : 0;
+      if (typeof m === 'number' && m >= 262144) return 261120;
+      if (typeof m === 'number' && m >= 131072) return 131072;
+    } catch (e) {}
+    return CHUNK_SIZE;
+  }
+
+  function sendAbort(transferId) {
+    var msg = JSON.stringify({ type: 'abort', transferId: transferId });
+    try { if (dc && dc.readyState === 'open') dc.send(msg); } catch (e) {}
+    for (var i = 0; i < fileSlots.length; i++) {
+      try {
+        var c = fileSlots[i] && fileSlots[i].ch;
+        if (c && c.readyState === 'open') c.send(msg);
+      } catch (e) {}
+    }
+  }
+
+  async function sendOneFile(item, ch) {
     var file = item.file;
     var transferId = item.transferId;
-    var totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+    if (!ch) ch = dc;
+    var cs = pickChunkSize(item.forceCs);
+    var totalChunks = Math.max(1, Math.ceil(file.size / cs));
     var meta = {
       type: 'meta',
       transferId: transferId,
@@ -439,43 +694,81 @@ window.P2P = (function () {
       name: file.name,
       size: file.size,
       mime: file.type || 'application/octet-stream',
-      totalChunks: totalChunks
+      totalChunks: totalChunks,
+      chunkSize: cs
     };
-    dc.send(JSON.stringify(meta));
+    ch.send(JSON.stringify(meta));
     emit('send-start', { transferId: transferId, name: file.name, size: file.size, totalChunks: totalChunks });
     var offset = 0;
     var idx = 0;
+    var fileCrc = 0xFFFFFFFF;
     var startedAt = Date.now();
     while (offset < file.size) {
       if (closed) throw new Error('closed');
-      while (dc.bufferedAmount > HIGH_WATER) {
-        await waitForDrain(dc);
+      if (item.cancelled) throw { message: 'cancelled', fileName: file.name, remote: item.cancelled === 'remote' };
+      var stuckMs = 0;
+      while (ch.bufferedAmount > HIGH_WATER) {
+        var before = ch.bufferedAmount;
+        var drained = await new Promise(function (resolve) {
+          var done = false;
+          var timer = setTimeout(function () {
+            if (done) return;
+            done = true;
+            resolve(false);
+          }, 3000);
+          waitForDrain(ch).then(function () {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            resolve(true);
+          });
+        });
+        if (drained) break;
+        if (ch.bufferedAmount < before) { stuckMs = 0; continue; }
+        stuckMs += 3000;
+        if (stuckMs >= 15000) {
+          if (ch._resumeSend) ch._resumeSend = null;
+          throw { message: 'stalled', fileName: file.name };
+        }
       }
-      if (closed || !dc || dc.readyState !== 'open') throw new Error('closed');
-      var end = Math.min(offset + CHUNK_SIZE, file.size);
+      if (item.cancelled) throw { message: 'cancelled', fileName: file.name, remote: item.cancelled === 'remote' };
+      if (closed || !ch || ch.readyState !== 'open') throw new Error('closed');
+      var jsMark = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      var end = Math.min(offset + cs, file.size);
       var slice = file.slice(offset, end);
-      var buf = await slice.arrayBuffer();
-      dc.send(buf);
+      var buf = await Promise.race([
+        slice.arrayBuffer(),
+        new Promise(function (_, reject) {
+          setTimeout(function () { reject(new Error('read-timeout')); }, 30000);
+        })
+      ]);
+      ch.send(buf);
       offset = end;
       idx++;
+      fileCrc = crc32Update(fileCrc, new Uint8Array(buf));
       var now = Date.now();
       bytesSentWindow.push({ t: now, n: buf.byteLength });
-      emit('send-progress', {
-        transferId: transferId,
-        name: file.name,
-        sent: offset,
-        size: file.size,
-        chunks: idx,
-        totalChunks: totalChunks,
-        rate: windowRate(bytesSentWindow, now),
-        elapsed: (now - startedAt) / 1000
-      });
-      await new Promise(function (r) { setTimeout(r, 0); });
+      loopSum += now - jsMark;
+      loopN++;
+      if (now - lastSendEmit >= 100 || offset >= file.size) {
+        lastSendEmit = now;
+        emit('send-progress', {
+          transferId: transferId,
+          name: file.name,
+          sent: offset,
+          size: file.size,
+          chunks: idx,
+          totalChunks: totalChunks,
+          rate: windowRate(bytesSentWindow, now),
+          elapsed: (now - startedAt) / 1000
+        });
+      }
+      if ((idx & 31) === 0) await new Promise(function (r) { setTimeout(r, 0); });
     }
     if (file.size === 0) {
-      dc.send(new ArrayBuffer(0));
+      ch.send(new ArrayBuffer(0));
     }
-    dc.send(JSON.stringify({ type: 'eof', transferId: transferId }));
+    ch.send(JSON.stringify({ type: 'eof', transferId: transferId, crc: (fileCrc ^ 0xFFFFFFFF) >>> 0 }));
     emit('send-done', { transferId: transferId, name: file.name, size: file.size, elapsed: (Date.now() - startedAt) / 1000 });
   }
 
@@ -502,7 +795,7 @@ window.P2P = (function () {
   }
 
   function sendFiles(fileList) {
-    if (!dc || dc.readyState !== 'open') {
+    if (!dc || closed || dc.readyState === 'closed' || dc.readyState === 'closing') {
       emit('error', { message: 'not_connected' });
       return false;
     }
@@ -516,19 +809,32 @@ window.P2P = (function () {
 
   async function disconnect(sendTeardown) {
     if (sendTeardown === undefined) sendTeardown = true;
+    if (sendTeardown && dc && dc.readyState !== 'closed' && dc.readyState !== 'closing') {
+      var openWaited = 0;
+      while (dc.readyState !== 'open' && openWaited < 1000) {
+        await new Promise(function (r) { setTimeout(r, 50); });
+        openWaited += 50;
+      }
+    }
     if (sendTeardown && dc && dc.readyState === 'open') {
       try { dc.send(JSON.stringify({ type: 'teardown' })); } catch (e) {}
+      var waited = 0;
+      while (dc.bufferedAmount > 0 && waited < 2000) {
+        await new Promise(function (r) { setTimeout(r, 50); });
+        waited += 50;
+      }
     }
     closed = true;
     stopPolling();
+    stopPing();
     clearReconnectTimer();
-    if (dc && dc._resumeSend) {
-      var resume = dc._resumeSend;
-      dc._resumeSend = null;
-      try { resume(); } catch (e) {}
+    settleWaiter(dc);
+    for (var si = 0; si < fileSlots.length; si++) {
+      if (fileSlots[si]) settleWaiter(fileSlots[si].ch);
     }
     sendQueue = [];
-    sending = false;
+    activeCount = 0;
+    activeSends = {};
     incoming = Object.create(null);
     try { if (dc) dc.close(); } catch (e) {}
     try { if (pc) pc.close(); } catch (e) {}
@@ -536,8 +842,29 @@ window.P2P = (function () {
     emit('disconnected', {});
   }
 
+  function cancelTransfer(id) {
+    if (!id) return false;
+    for (var i = 0; i < sendQueue.length; i++) {
+      if (sendQueue[i].transferId === id) {
+        sendQueue.splice(i, 1);
+        return true;
+      }
+    }
+    if (activeSends[id]) {
+      activeSends[id].item.cancelled = true;
+      settleWaiter(activeSends[id].ch);
+      return true;
+    }
+    if (incoming[id]) {
+      delete incoming[id];
+      sendAbort(id);
+      return true;
+    }
+    return false;
+  }
+
   function transferInProgress() {
-    return sending || sendQueue.length > 0 || Object.keys(incoming).length > 0;
+    return activeCount > 0 || sendQueue.length > 0 || Object.keys(incoming).length > 0;
   }
 
   function debug() {
@@ -548,6 +875,11 @@ window.P2P = (function () {
       conn: pc ? pc.connectionState : '-',
       dc: dc ? dc.readyState : '-',
       sig: signalGone ? 'gone' : 'live',
+      fast: peerNew,
+      fast: peerNew,
+      rtt: lastRtt,
+      loopMs: loopN ? Math.round((loopSum / loopN) * 100) / 100 : 0,
+      maxMsg: (pc && pc.sctp) ? pc.sctp.maxMessageSize : 0,
       fails: failCount,
       sentCands: statSentCands,
       gotCands: Object.keys(seenRemoteCands).length
@@ -559,6 +891,7 @@ window.P2P = (function () {
     createHost: createHost,
     joinSession: joinSession,
     sendText: sendText,
+    cancelTransfer: cancelTransfer,
     sendExtend: sendExtend,
     sendFiles: sendFiles,
     disconnect: disconnect,
