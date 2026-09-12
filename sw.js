@@ -1,11 +1,11 @@
-var CACHE = 'wishare-v22';
+var CACHE = 'wishare-v39';
 var SHELL = [
   './',
   'index.php',
   'manifest.json',
-  'assets/css/custom.css?v=22',
-  'assets/js/app.js?v=22',
-  'assets/js/webrtc.js?v=22',
+  'assets/css/custom.css?v=39',
+  'assets/js/app.js?v=39',
+  'assets/js/webrtc.js?v=39',
   'assets/icons/icon-192.png',
   'assets/icons/icon-512.png',
   'assets/audio/incoming.mp3'
