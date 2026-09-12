@@ -4,6 +4,8 @@ Ephemeral, bidirectional file and text transfer directly between browsers over l
 
 🚀 **Live version: https://nodrama.au/WiShare/**
 
+*License: GNU General Public License v3.0 — see [LICENSE](LICENSE).*
+
 ## How it works
 
 1. One device taps **Send / Host** and gets a 4-digit PIN (5-minute expiry, radial countdown).
@@ -14,7 +16,10 @@ The server is purely an **ephemeral signaling broker**: short-polled PHP flat-fi
 
 ## Features
 
-- 64 KB chunked binary streaming with 1 MB / 8 MB backpressure flow control (no tab crashes on large files)
+- Up to 3 simultaneous file transfers over dedicated data channels (sequential legacy fallback for older peers)
+- Adaptive 64–255 KB chunking with CRC32 end-to-end integrity verification per file
+- 2 MB backpressure flow control, stall watchdog with abort + smaller-chunk auto-retry
+- Per-transfer cancel (both directions converge), delivery confirmation toasts
 - ICE restart with 30 s self-healing window (survives Wi-Fi toggles and backgrounded tabs)
 - Drag-and-drop (Linux) + native picker (Android); gesture-only Download buttons, plus one-tap **Download all (.zip)**
 - Text clipboard with copy buttons, per-entry delete, Ctrl+Enter to send
@@ -27,9 +32,11 @@ The server is purely an **ephemeral signaling broker**: short-polled PHP flat-fi
 
 ```text
 ├── api.php                  # Atomic signaling router, brute-force throttle, auto-prune
-├── index.php                # App shell (Tailwind via CDN, jQuery, JSZip)
+├── index.php                # App shell (Tailwind via CDN, JSZip)
 ├── manifest.json            # PWA manifest
 ├── sw.js                    # Service worker (versioned precache)
+├── LICENSE                  # GPLv3
+├── README.md                # This file
 ├── sessions/                # Ephemeral JSON handshake files (deny-all via .htaccess)
 └── assets/
     ├── audio/incoming.mp3   # Incoming-transfer chime
@@ -44,7 +51,8 @@ The server is purely an **ephemeral signaling broker**: short-polled PHP flat-fi
 
 1. Upload everything, preserving the tree. Ensure PHP can write to `sessions/` (runs as your user on cPanel by default).
 2. Confirm `https://<host>/sessions/` returns **403** (the bundled `.htaccess` denies all direct access).
-3. Open the app on both devices on the **same Wi-Fi** (same band helps on routers with client isolation).
+3. If your host injects a `Content-Security-Policy`, allow the CDN `script-src` hosts, `style-src 'unsafe-inline'` (Tailwind Play), and `connect-src stun: turn:` (WebRTC ICE).
+4. Open the app on both devices on the **same Wi-Fi** (same band helps on routers with client isolation).
 
 ## Notes
 
