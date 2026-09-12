@@ -274,7 +274,7 @@ function mergeCandidates(array $existing, array $incoming): array {
     return $existing;
 }
 
-function publicState(array $s): array {
+function publicState(array $s, ?string $role = null): array {
     return [
         'pin' => $s['pin'] ?? null,
         'offer' => $s['offer'] ?? null,
@@ -283,6 +283,7 @@ function publicState(array $s): array {
         'joiner_candidates' => $s['joiner_candidates'] ?? [],
         'status' => $s['status'] ?? 'waiting',
         'last_activity' => $s['last_activity'] ?? time(),
+        'peer_cv' => $role === 'host' ? ($s['joiner_cv'] ?? null) : ($s['host_cv'] ?? null),
     ];
 }
 
@@ -315,6 +316,8 @@ if ($action === 'create') {
         'offer' => null,
         'answer' => null,
         'status' => 'waiting',
+        'host_cv' => null,
+        'joiner_cv' => null,
     ];
     $path = sessionPath($pinNew);
     $fp = @fopen($path, 'x');
@@ -383,6 +386,7 @@ if ($action === 'signal') {
     $answer = $body['answer'] ?? null;
     $candidates = $body['candidates'] ?? null;
     $statusIn = $body['status'] ?? null;
+    $cv = $body['cv'] ?? null;
     if (($offer !== null && !is_array($offer)) || ($answer !== null && !is_array($answer))) {
         jexit(['ok' => false, 'error' => 'bad_sdp'], 400);
     }
@@ -397,8 +401,12 @@ if ($action === 'signal') {
         }
     }
     $allowedStatus = ['waiting','connecting','connected','expiring','closed'];
-    $updated = atomicUpdate($pinStr, function ($d) use ($role, $offer, $answer, $candidates, $statusIn, $allowedStatus) {
+    $updated = atomicUpdate($pinStr, function ($d) use ($role, $offer, $answer, $candidates, $statusIn, $allowedStatus, $cv) {
         $d['last_activity'] = time();
+        if (is_int($cv) && $cv >= 1 && $cv <= 99) {
+            if ($role === 'host') $d['host_cv'] = $cv;
+            else $d['joiner_cv'] = $cv;
+        }
         if ($role === 'host') {
             if (is_array($offer) && ($offer['type'] ?? null) === 'offer' && isset($offer['sdp']) && is_string($offer['sdp']) && $offer['sdp'] !== '') {
                 $d['offer'] = ['type' => 'offer', 'sdp' => (string)$offer['sdp']];
@@ -423,7 +431,7 @@ if ($action === 'signal') {
         recordProbe($ip);
         jexit(['ok' => false, 'error' => 'invalid_pin'], 404);
     }
-    jexit(array_merge(['ok' => true], publicState($updated)));
+    jexit(array_merge(['ok' => true], publicState($updated, $role)));
 }
 
 if ($action === 'cleanup') {
