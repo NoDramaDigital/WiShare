@@ -26,9 +26,8 @@ try {
   }
 } catch (e) {}
 </script>
-<script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha384-1H217gwSVyLSIfaLxHbE7dRb3v4mYCKbpQvzx0cegeju1MVsGrX5xXxAvs/HgeFs" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="assets/css/custom.css?v=22">
+<link rel="stylesheet" href="assets/css/custom.css?v=39">
 </head>
 <body class="h-svh text-slate-900 dark:text-slate-100 flex flex-col bg-decor">
 <header class="shrink-0 sticky top-0 z-40 border-b border-slate-200/70 dark:border-slate-800/70 bg-white/80 dark:bg-slate-950/80 backdrop-blur px-4 py-3 flex items-center justify-between">
@@ -145,18 +144,12 @@ try {
 
 <div id="tx-wrap" class="hidden card p-4">
 <p class="label-row"><span>📤 Sending</span></p>
-<div class="progress-track h-7 rounded-xl bg-slate-100 dark:bg-slate-800">
-<div id="tx-bar" class="progress-fill progress-send" style="width:0%">0%</div>
-</div>
-<p id="tx-meta" class="mt-1.5 text-xs font-mono opacity-70"></p>
+<div id="tx-list" class="txrx-list"></div>
 </div>
 
 <div id="rx-wrap" class="hidden card p-4">
 <p class="label-row"><span>📥 Receiving</span></p>
-<div class="progress-track h-7 rounded-xl bg-slate-100 dark:bg-slate-800">
-<div id="rx-bar" class="progress-fill progress-recv" style="width:0%">0%</div>
-</div>
-<p id="rx-meta" class="mt-1.5 text-xs font-mono opacity-70"></p>
+<div id="rx-list" class="txrx-list"></div>
 </div>
 
 <div class="pane-tabs md:hidden" role="tablist" aria-label="Workspace panes">
@@ -204,7 +197,7 @@ Ephemeral by design — signaling records self-destruct · payloads never touch 
 
 <div id="toast" class="hidden" role="status" aria-live="polite"></div>
 
-<script src="assets/js/webrtc.js?v=22"></script>
-<script src="assets/js/app.js?v=22"></script>
+<script src="assets/js/webrtc.js?v=39"></script>
+<script src="assets/js/app.js?v=39"></script>
 </body>
 </html>
