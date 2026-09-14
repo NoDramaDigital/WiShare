@@ -27,7 +27,7 @@ try {
 } catch (e) {}
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="assets/css/custom.css?v=39">
+<link rel="stylesheet" href="assets/css/custom.css?v=46">
 </head>
 <body class="h-svh text-slate-900 dark:text-slate-100 flex flex-col bg-decor">
 <header class="shrink-0 sticky top-0 z-40 border-b border-slate-200/70 dark:border-slate-800/70 bg-white/80 dark:bg-slate-950/80 backdrop-blur px-4 py-3 flex items-center justify-between">
@@ -191,13 +191,13 @@ try {
 </div>
 </main>
 
-<footer id="app-footer" class="shrink-0 border-t border-slate-200/70 dark:border-slate-800/70 px-4 py-3 text-center text-[11px] opacity-50">
+<footer id="app-footer" class="shrink-0 border-t border-slate-900/5 dark:border-slate-100/8 px-4 py-3 text-center text-[11px] opacity-50">
 Ephemeral by design — signaling records self-destruct · payloads never touch this server.<br><span id="app-ver" class="font-mono"></span>
 </footer>
 
 <div id="toast" class="hidden" role="status" aria-live="polite"></div>
 
-<script src="assets/js/webrtc.js?v=39"></script>
-<script src="assets/js/app.js?v=39"></script>
+<script src="assets/js/webrtc.js?v=46"></script>
+<script src="assets/js/app.js?v=46"></script>
 </body>
 </html>
