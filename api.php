@@ -10,6 +10,14 @@ const RATE_FILE = __DIR__ . '/sessions/ip_ratelimit.json';
 const SESSION_TTL = 300;
 const LOCKOUT_WINDOW = 900;
 const MAX_FAILS = 5;
+const PROBE_MAX = 30;
+const PROBE_WINDOW = 300;
+const PROBE_LOCK = 300;
+const CREATE_MAX = 10;
+const CREATE_WINDOW = 300;
+const STALE_TTL = 120;
+const HARD_TTL = 3600;
+const TRUST_CLOUDFLARE = false;
 
 if (!is_dir(SESS_DIR)) {
     @mkdir(SESS_DIR, 0700, true);
@@ -21,9 +29,40 @@ function jexit(array $data, int $code = 200): void {
     exit;
 }
 
+function readJsonBody(): array {
+    $raw = file_get_contents('php://input');
+    if (!is_string($raw) || $raw === '') return [];
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+function requirePost(string $method): void {
+    if ($method !== 'POST') jexit(['ok' => false, 'error' => 'method_not_allowed'], 405);
+}
+
+function requireUnlocked(array $rate, string $ip): void {
+    if (isLocked($ip, $rate)) {
+        jexit(['ok' => false, 'error' => 'rate_limited', 'retry_after' => ((int)$rate[$ip]['locked_until']) - time()], 429);
+    }
+}
+
+function failPin(string $ip): void {
+    $fails = recordFail($ip);
+    jexit(['ok' => false, 'error' => 'invalid_pin', 'remaining' => max(0, MAX_FAILS - $fails)], 404);
+}
+
 function clientIp(): string {
-    if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) return (string)$_SERVER['HTTP_CF_CONNECTING_IP'];
-    return (string)($_SERVER['REMOTE_ADDR'] ?? 'unknown');
+    $remote = (string)($_SERVER['REMOTE_ADDR'] ?? 'unknown');
+    $cf = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? null;
+    if (TRUST_CLOUDFLARE && is_string($cf) && $cf !== '' && filter_var($cf, FILTER_VALIDATE_IP)) {
+        return $cf;
+    }
+    if (is_string($cf) && $cf !== '' && filter_var($cf, FILTER_VALIDATE_IP)) {
+        if (!filter_var($remote, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            return $cf;
+        }
+    }
+    return $remote;
 }
 
 function pruneSessions(): void {
@@ -35,7 +74,10 @@ function pruneSessions(): void {
             @unlink($f);
             continue;
         }
-        if ((time() - (int)$d['created_at']) > SESSION_TTL) {
+        $now = time();
+        $age = $now - (int)$d['created_at'];
+        $idle = $now - (int)($d['last_activity'] ?? 0);
+        if ($age > HARD_TTL || ($age > SESSION_TTL && $idle > STALE_TTL)) {
             @unlink($f);
         }
     }
@@ -191,10 +233,6 @@ function recordFail(string $ip): int {
     return is_int($res) ? $res : MAX_FAILS;
 }
 
-const PROBE_MAX = 30;
-const PROBE_WINDOW = 300;
-const PROBE_LOCK = 300;
-
 function probeKey(string $ip): string {
     return 'probe:' . $ip;
 }
@@ -236,9 +274,9 @@ function createLimited(string $ip): bool {
         $entry = $d[$key] ?? ['attempts' => [], 'locked_until' => 0];
         $attempts = array_values(array_filter(
             (array)($entry['attempts'] ?? []),
-            fn($t) => ($now - (int)$t) < 300
+            fn($t) => ($now - (int)$t) < CREATE_WINDOW
         ));
-        if (count($attempts) >= 10) {
+        if (count($attempts) >= CREATE_MAX) {
             return [$d, true];
         }
         $attempts[] = $now;
@@ -264,10 +302,12 @@ function mergeCandidates(array $existing, array $incoming): array {
         $k = candKey($c);
         if (isset($seen[$k])) continue;
         if (count($existing) >= 500) break;
+        $mid = $c['sdpMid'] ?? null;
+        $mli = $c['sdpMLineIndex'] ?? null;
         $existing[] = [
             'candidate' => (string)$c['candidate'],
-            'sdpMid' => $c['sdpMid'] ?? null,
-            'sdpMLineIndex' => $c['sdpMLineIndex'] ?? null,
+            'sdpMid' => is_string($mid) ? $mid : null,
+            'sdpMLineIndex' => is_int($mli) ? $mli : (is_numeric($mli) ? (int)$mli : null),
         ];
         $seen[$k] = true;
     }
@@ -291,17 +331,12 @@ pruneSessions();
 
 $action = $_GET['action'] ?? '';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
-$rawBody = file_get_contents('php://input');
-$body = [];
-if (is_string($rawBody) && $rawBody !== '') {
-    $decoded = json_decode($rawBody, true);
-    if (is_array($decoded)) $body = $decoded;
-}
+$body = readJsonBody();
 $pin = $_GET['pin'] ?? ($body['pin'] ?? null);
 $role = $_GET['role'] ?? ($body['role'] ?? null);
 
 if ($action === 'create') {
-    if ($method !== 'POST') jexit(['ok' => false, 'error' => 'method_not_allowed'], 405);
+    requirePost($method);
     if (createLimited(clientIp())) {
         jexit(['ok' => false, 'error' => 'rate_limited', 'retry_after' => 300], 429);
     }
@@ -319,31 +354,28 @@ if ($action === 'create') {
         'host_cv' => null,
         'joiner_cv' => null,
     ];
+    $existing = glob(SESS_DIR . '/sess_*.json');
+    if (is_array($existing) && count($existing) > 500) {
+        jexit(['ok' => false, 'error' => 'server_busy', 'retry_after' => 60], 503);
+    }
     $path = sessionPath($pinNew);
     $fp = @fopen($path, 'x');
     if ($fp === false) jexit(['ok' => false, 'error' => 'pin_collision_retry'], 500);
+    @chmod($path, 0600);
     fwrite($fp, (string)json_encode($session, JSON_UNESCAPED_SLASHES));
     fclose($fp);
     jexit(['ok' => true, 'pin' => $pinNew, 'created_at' => $now, 'status' => 'waiting']);
 }
 
 if ($action === 'join') {
-    if ($method !== 'POST') jexit(['ok' => false, 'error' => 'method_not_allowed'], 405);
+    requirePost($method);
     $ip = clientIp();
     $rate = loadRate();
-    if (isLocked($ip, $rate)) {
-        jexit(['ok' => false, 'error' => 'rate_limited', 'retry_after' => ((int)$rate[$ip]['locked_until']) - time()], 429);
-    }
-    if (!validPinFormat(is_string($pin) ? $pin : null)) {
-        $fails = recordFail($ip);
-        jexit(['ok' => false, 'error' => 'invalid_pin', 'remaining' => max(0, MAX_FAILS - $fails)], 404);
-    }
+    requireUnlocked($rate, $ip);
+    if (!validPinFormat(is_string($pin) ? $pin : null)) failPin($ip);
     $path = sessionPath((string)$pin);
     $s = readSessionLocked($path);
-    if ($s === null) {
-        $fails = recordFail($ip);
-        jexit(['ok' => false, 'error' => 'invalid_pin', 'remaining' => max(0, MAX_FAILS - $fails)], 404);
-    }
+    if ($s === null) failPin($ip);
     if ((time() - (int)($s['created_at'] ?? 0)) > SESSION_TTL) {
         @unlink($path);
         jexit(['ok' => false, 'error' => 'expired'], 410);
@@ -353,21 +385,17 @@ if ($action === 'join') {
         if (($d['status'] ?? 'waiting') === 'waiting') $d['status'] = 'connecting';
         return $d;
     });
-    if ($updated === null) {
-        $fails = recordFail($ip);
-        jexit(['ok' => false, 'error' => 'invalid_pin', 'remaining' => max(0, MAX_FAILS - $fails)], 404);
-    }
+    if ($updated === null) failPin($ip);
     clearFails($ip);
     $fresh = readSessionLocked($path);
     jexit(['ok' => true, 'pin' => (string)$pin, 'status' => $fresh['status'] ?? 'connecting']);
 }
 
 if ($action === 'signal') {
+    requirePost($method);
     $ip = clientIp();
     $rate = loadRate();
-    if (isLocked($ip, $rate)) {
-        jexit(['ok' => false, 'error' => 'rate_limited', 'retry_after' => ((int)$rate[$ip]['locked_until']) - time()], 429);
-    }
+    requireUnlocked($rate, $ip);
     if (!validPinFormat(is_string($pin) ? $pin : null)) {
         recordProbe($ip);
         jexit(['ok' => false, 'error' => 'invalid_pin'], 404);
@@ -435,8 +463,17 @@ if ($action === 'signal') {
 }
 
 if ($action === 'cleanup') {
-    if ($method !== 'POST') jexit(['ok' => false, 'error' => 'method_not_allowed'], 405);
+    requirePost($method);
     if (!validPinFormat(is_string($pin) ? $pin : null)) jexit(['ok' => false, 'error' => 'invalid_pin'], 404);
+    $ip = clientIp();
+    $rate = loadRate();
+    if (isProbeLocked($ip, $rate)) {
+        jexit(['ok' => false, 'error' => 'rate_limited', 'retry_after' => ((int)$rate[probeKey($ip)]['locked_until']) - time()], 429);
+    }
+    recordProbe($ip);
+    if (!file_exists(sessionPath((string)$pin))) {
+        jexit(['ok' => true, 'cleaned' => true]);
+    }
     @unlink(sessionPath((string)$pin));
     jexit(['ok' => true, 'cleaned' => true]);
 }
