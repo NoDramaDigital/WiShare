@@ -9,7 +9,10 @@ window.P2P = (function () {
   var CHUNK_SIZE = 65536;
   var LOW_THRESHOLD = 524288;
   var HIGH_WATER = 2097152;
+  var MAX_INCOMING_BYTES = 4294967296;
   var POLL_MS = 1100;
+  var POLL_IDLE_MS = 2500;
+  var PING_MS = 5000;
   var RECONNECT_WINDOW_MS = 30000;
   var PROTO_VER = 1;
 
@@ -19,6 +22,8 @@ window.P2P = (function () {
   var pin = null;
   var pollTimer = null;
   var pollActive = false;
+  var pollStopped = true;
+  var pollSched = 0;
   var unsentCandidates = [];
   var seenRemoteCands = {};
   var appliedOfferSdp = null;
@@ -55,6 +60,16 @@ window.P2P = (function () {
     }
   }
 
+  function sendJson(ch, obj) {
+    try {
+      if (!ch || ch.readyState !== 'open') return false;
+      ch.send(JSON.stringify(obj));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function uuid() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
     return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
@@ -65,17 +80,45 @@ window.P2P = (function () {
   }
 
   async function postSignal(payload) {
-    var res = await fetch('api.php?action=signal&pin=' + encodeURIComponent(pin) + '&role=' + encodeURIComponent(role), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
+    var ctrl = null;
+    var timer = null;
+    try {
+      if (typeof AbortController !== 'undefined') {
+        ctrl = new AbortController();
+        timer = setTimeout(function () {
+          try { ctrl.abort(); } catch (e) {}
+        }, 15000);
+      }
+      var opts = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      };
+      if (ctrl) opts.signal = ctrl.signal;
+      var res = await fetch('api.php?action=signal&pin=' + encodeURIComponent(pin) + '&role=' + encodeURIComponent(role), opts);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
     if (!res.ok) {
       var err = new Error('signal_http_' + res.status);
       err.status = res.status;
       throw err;
     }
     return res.json();
+  }
+
+  function pollDelay() {
+    if (connectedFlag && unsentCandidates.length === 0 && failCount === 0) return POLL_IDLE_MS;
+    return POLL_MS;
+  }
+
+  function scheduleNextPoll() {
+    if (closed || pollStopped) return;
+    var my = ++pollSched;
+    pollTimer = setTimeout(function () {
+      if (pollSched !== my) return;
+      pollOnce();
+    }, pollDelay());
   }
 
   async function pollOnce() {
@@ -86,6 +129,7 @@ window.P2P = (function () {
         var ent = incoming[tid];
         if (ent && sweepNow - (ent.lastProgress || ent.startedAt || 0) > 30000) {
           delete incoming[tid];
+          sendAbort(tid);
           emit('recv-stalled', { transferId: tid, name: ent.meta ? ent.meta.name : 'file' });
         }
       }
@@ -123,8 +167,13 @@ window.P2P = (function () {
       await applyRemoteState(state);
     } catch (e) {
       failCount++;
-      if (e && e.status === 413 && out.candidates) {
-        unsentCandidates.splice(0, out.candidates.length);
+      if (e && e.status === 413) {
+        if (out.candidates) unsentCandidates.splice(0, out.candidates.length);
+        if (out.offer || out.answer) {
+          signalGone = true;
+          stopPolling();
+          emit('error', { message: 'sdp_too_large' });
+        }
       }
       if (e && e.status === 404 && failCount >= 3 && !signalGone) {
         signalGone = true;
@@ -133,21 +182,51 @@ window.P2P = (function () {
       }
     } finally {
       pollActive = false;
+      scheduleNextPoll();
     }
   }
 
-  var CRC_TABLE = null;
-  function crc32Update(crc, bytes) {
-    if (!CRC_TABLE) {
-      var t = new Array(256);
-      for (var n = 0; n < 256; n++) {
-        var c = n;
-        for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-        t[n] = c;
-      }
-      CRC_TABLE = t;
+  var CRC_T = null;
+  function crcStep(t0, crc, b) {
+    return (t0[(crc ^ b) & 0xFF] ^ (crc >>> 8)) >>> 0;
+  }
+  function crcTables() {
+    if (CRC_T) return CRC_T;
+    var t0 = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t0[n] = c >>> 0;
     }
-    for (var i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    var T = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+    for (var pos = 0; pos < 4; pos++) {
+      for (var v = 0; v < 256; v++) {
+        var b0 = pos === 0 ? v : 0;
+        var b1 = pos === 1 ? v : 0;
+        var b2 = pos === 2 ? v : 0;
+        var b3 = pos === 3 ? v : 0;
+        var r = 0;
+        r = crcStep(t0, r, b0);
+        r = crcStep(t0, r, b1);
+        r = crcStep(t0, r, b2);
+        r = crcStep(t0, r, b3);
+        T[pos][v] = r;
+      }
+    }
+    CRC_T = { std: t0, quad: T };
+    return CRC_T;
+  }
+  function crc32Update(crc, bytes) {
+    var T = crcTables();
+    var std = T.std, quad = T.quad;
+    var i = 0;
+    var stop = bytes.length - (bytes.length % 4);
+    crc = crc >>> 0;
+    for (; i < stop; i += 4) {
+      crc ^= bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24);
+      crc = (quad[0][crc & 0xFF] ^ quad[1][(crc >>> 8) & 0xFF] ^ quad[2][(crc >>> 16) & 0xFF] ^ quad[3][(crc >>> 24) & 0xFF]) >>> 0;
+    }
+    for (; i < bytes.length; i++) crc = (std[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8)) >>> 0;
     return crc;
   }
 
@@ -196,12 +275,14 @@ window.P2P = (function () {
 
   function startPolling() {
     stopPolling();
-    pollTimer = setInterval(pollOnce, POLL_MS);
+    pollStopped = false;
     pollOnce();
   }
 
   function stopPolling() {
-    if (pollTimer) clearInterval(pollTimer);
+    pollStopped = true;
+    pollSched++;
+    if (pollTimer) clearTimeout(pollTimer);
     pollTimer = null;
   }
 
@@ -312,6 +393,10 @@ window.P2P = (function () {
     fileSlots[idx] = { ch: ch, open: ch.readyState === 'open', busy: false, transferId: null };
   }
 
+  function sleep(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
+
   function waitForDrain(ch) {
     return new Promise(function (resolve) {
       if (ch.bufferedAmount <= LOW_THRESHOLD) return resolve();
@@ -355,6 +440,17 @@ window.P2P = (function () {
         var expect = Math.max(1, Math.ceil(msg.size / cs));
         if (msg.totalChunks !== expect || msg.totalChunks > 350000) return;
         if (ch) ch._transferId = msg.transferId;
+        var inFlight = 0;
+        for (var tId in incoming) {
+          var ent = incoming[tId];
+          if (ent && ent.meta) inFlight += (ent.meta.size || 0);
+        }
+        if (inFlight + msg.size > MAX_INCOMING_BYTES) {
+          try { sendJson(ch, { type: 'abort', transferId: msg.transferId }); } catch (e) {}
+          emit('error', { message: 'incoming-over-budget', name: msg.name, transferId: msg.transferId });
+          delete incoming[msg.transferId];
+          return;
+        }
         incoming[msg.transferId] = {
           meta: msg,
           chunks: new Array(msg.totalChunks),
@@ -398,11 +494,9 @@ window.P2P = (function () {
             url: url,
             blob: blob
           });
-          try {
-            var ackCh = (ch && ch.readyState === 'open') ? ch : null;
-            if (!ackCh && dc && dc.readyState === 'open') ackCh = dc;
-            if (ackCh) ackCh.send(JSON.stringify({ type: 'received', transferId: msg.transferId }));
-          } catch (ackErr) {}
+          if (!sendJson(ch, { type: 'received', transferId: msg.transferId })) {
+            sendJson(dc, { type: 'received', transferId: msg.transferId });
+          }
         } catch (err) {
           emit('error', { message: 'assemble_failed', transferId: msg.transferId });
         }
@@ -414,7 +508,7 @@ window.P2P = (function () {
         var mins = (typeof msg.minutes === 'number' && msg.minutes > 0 && msg.minutes <= 30) ? msg.minutes : 5;
         emit('extend-received', { minutes: mins });
       } else if (msg.type === 'ping' && typeof msg.t === 'number') {
-        try { dc.send(JSON.stringify({ type: 'pong', t: msg.t })); } catch (e) {}
+        sendJson(dc, { type: 'pong', t: msg.t });
       } else if (msg.type === 'pong' && typeof msg.t === 'number') {
         var rtt = Date.now() - msg.t;
         if (rtt >= 0 && rtt < 60000) lastRtt = rtt;
@@ -427,6 +521,13 @@ window.P2P = (function () {
         } else if (incoming[msg.transferId]) {
           delete incoming[msg.transferId];
           emit('recv-aborted', { transferId: msg.transferId });
+        }
+        for (var sxi = 0; sxi < sendQueue.length; sxi++) {
+          if (sendQueue[sxi].transferId === msg.transferId) {
+            var queued = sendQueue.splice(sxi, 1)[0];
+            emit('send-cancelled', { transferId: msg.transferId, name: queued.file.name, remote: true });
+            break;
+          }
         }
       } else if (msg.type === 'teardown') {
         emit('teardown', {});
@@ -494,8 +595,8 @@ window.P2P = (function () {
     stopPing();
     pingTimer = setInterval(function () {
       if (closed || !dc || dc.readyState !== 'open') return;
-      try { dc.send(JSON.stringify({ type: 'ping', t: Date.now() })); } catch (e) {}
-    }, 2000);
+      sendJson(dc, { type: 'ping', t: Date.now() });
+    }, PING_MS);
   }
 
   function stopPing() {
@@ -510,6 +611,7 @@ window.P2P = (function () {
 
   function reset() {
     stopPolling();
+    pollStopped = false;
     clearReconnectTimer();
     stopPing();
     settleWaiter(dc);
@@ -572,15 +674,18 @@ window.P2P = (function () {
     pc = new RTCPeerConnection(rtcConfig);
     wireConnectionEvents();
     pc.ondatachannel = function (e) {
-      var label = (e.channel && e.channel.label) || '';
+      var incoming = e.channel;
+      var label = (incoming && incoming.label) || '';
       if (label.indexOf('file-') === 0) {
         var idx = parseInt(label.slice(5), 10);
-        if (idx >= 0 && idx < FILE_SLOTS) {
-          wireFileChannel(e.channel, idx);
+        if (idx >= 0 && idx < FILE_SLOTS && String(idx) === label.slice(5)) {
+          wireFileChannel(incoming, idx);
           return;
         }
+        return;
       }
-      dc = e.channel;
+      if (label !== 'transferChannel' || !incoming) return;
+      dc = incoming;
       wireChannel(dc);
     };
     startPolling();
@@ -655,10 +760,6 @@ window.P2P = (function () {
     }
   }
 
-  function processQueue() {
-    dispatchQueue();
-  }
-
   function pickChunkSize(force) {
     if (typeof force === 'number' && (force | 0) === force && force >= 4096 && force <= 1048576) return force;
     if (!peerNew) return CHUNK_SIZE;
@@ -671,14 +772,22 @@ window.P2P = (function () {
   }
 
   function sendAbort(transferId) {
-    var msg = JSON.stringify({ type: 'abort', transferId: transferId });
-    try { if (dc && dc.readyState === 'open') dc.send(msg); } catch (e) {}
+    var frame = { type: 'abort', transferId: transferId };
+    sendJson(dc, frame);
     for (var i = 0; i < fileSlots.length; i++) {
-      try {
-        var c = fileSlots[i] && fileSlots[i].ch;
-        if (c && c.readyState === 'open') c.send(msg);
-      } catch (e) {}
+      var c = fileSlots[i] && fileSlots[i].ch;
+      if (c !== dc) sendJson(c, frame);
     }
+  }
+
+  function readSlice(file, offset, size) {
+    var slice = file.slice(offset, Math.min(offset + size, file.size));
+    return Promise.race([
+      slice.arrayBuffer(),
+      new Promise(function (_, reject) {
+        setTimeout(function () { reject(new Error('read-timeout')); }, 30000);
+      })
+    ]);
   }
 
   async function sendOneFile(item, ch) {
@@ -734,16 +843,9 @@ window.P2P = (function () {
       if (item.cancelled) throw { message: 'cancelled', fileName: file.name, remote: item.cancelled === 'remote' };
       if (closed || !ch || ch.readyState !== 'open') throw new Error('closed');
       var jsMark = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
-      var end = Math.min(offset + cs, file.size);
-      var slice = file.slice(offset, end);
-      var buf = await Promise.race([
-        slice.arrayBuffer(),
-        new Promise(function (_, reject) {
-          setTimeout(function () { reject(new Error('read-timeout')); }, 30000);
-        })
-      ]);
+      var buf = await readSlice(file, offset, cs);
       ch.send(buf);
-      offset = end;
+      offset += buf.byteLength;
       idx++;
       fileCrc = crc32Update(fileCrc, new Uint8Array(buf));
       var now = Date.now();
@@ -763,7 +865,7 @@ window.P2P = (function () {
           elapsed: (now - startedAt) / 1000
         });
       }
-      if ((idx & 31) === 0) await new Promise(function (r) { setTimeout(r, 0); });
+      if ((idx & 31) === 0) await sleep(0);
     }
     if (file.size === 0) {
       ch.send(new ArrayBuffer(0));
@@ -779,19 +881,16 @@ window.P2P = (function () {
       emit('error', { message: 'not_connected' });
       return false;
     }
-    dc.send(JSON.stringify({ type: 'text', transferId: uuid(), text: text, ts: Date.now() }));
+    if (!sendJson(dc, { type: 'text', transferId: uuid(), text: text, ts: Date.now() })) {
+      emit('error', { message: 'not_connected' });
+      return false;
+    }
     emit('text-sent', { text: text });
     return true;
   }
 
   function sendExtend(minutes) {
-    if (!dc || dc.readyState !== 'open') return false;
-    try {
-      dc.send(JSON.stringify({ type: 'extend', minutes: minutes, ts: Date.now() }));
-    } catch (e) {
-      return false;
-    }
-    return true;
+    return sendJson(dc, { type: 'extend', minutes: minutes, ts: Date.now() });
   }
 
   function sendFiles(fileList) {
@@ -803,7 +902,7 @@ window.P2P = (function () {
     for (var i = 0; i < files.length; i++) {
       sendQueue.push({ file: files[i], transferId: uuid() });
     }
-    processQueue();
+    dispatchQueue();
     return true;
   }
 
@@ -812,15 +911,14 @@ window.P2P = (function () {
     if (sendTeardown && dc && dc.readyState !== 'closed' && dc.readyState !== 'closing') {
       var openWaited = 0;
       while (dc.readyState !== 'open' && openWaited < 1000) {
-        await new Promise(function (r) { setTimeout(r, 50); });
+        await sleep(50);
         openWaited += 50;
       }
     }
-    if (sendTeardown && dc && dc.readyState === 'open') {
-      try { dc.send(JSON.stringify({ type: 'teardown' })); } catch (e) {}
+    if (sendTeardown && sendJson(dc, { type: 'teardown' })) {
       var waited = 0;
       while (dc.bufferedAmount > 0 && waited < 2000) {
-        await new Promise(function (r) { setTimeout(r, 50); });
+        await sleep(50);
         waited += 50;
       }
     }
@@ -875,7 +973,6 @@ window.P2P = (function () {
       conn: pc ? pc.connectionState : '-',
       dc: dc ? dc.readyState : '-',
       sig: signalGone ? 'gone' : 'live',
-      fast: peerNew,
       fast: peerNew,
       rtt: lastRtt,
       loopMs: loopN ? Math.round((loopSum / loopN) * 100) / 100 : 0,
