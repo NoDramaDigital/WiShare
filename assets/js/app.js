@@ -1,5 +1,5 @@
 (function () {
-  var APP_VER = 'v39';
+  var APP_VER = 'v46';
   var APP_BUILD = 1;
   function paintDims() {
     try {
@@ -18,6 +18,7 @@
   var sessionTimer = null;
   var hostDeadline = 0;
   var sessionDeadline = 0;
+  var sessionFloor = 0;
   var sessionExpiring = false;
   var currentPin = null;
   var currentRole = null;
@@ -25,6 +26,8 @@
   var txState = Object.create(null);
   var rxState = Object.create(null);
   var receivedBlobs = [];
+  var receivedAggBytes = 0;
+  var aggWarned = false;
 
   function show(name) {
     views.forEach(function (v) {
@@ -82,12 +85,26 @@
     }, 2200);
   }
 
-  async function api(path, body) {
-    var res = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : '{}'
-    });
+  async function api(path, body, timeoutMs) {
+    var ctrl = null;
+    var timer = null;
+    try {
+      if (typeof AbortController !== 'undefined') {
+        ctrl = new AbortController();
+        timer = setTimeout(function () {
+          try { ctrl.abort(); } catch (e) {}
+        }, timeoutMs || 15000);
+      }
+      var opts = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : '{}'
+      };
+      if (ctrl) opts.signal = ctrl.signal;
+      var res = await fetch(path, opts);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
     var data = null;
     try { data = await res.json(); } catch (e) {}
     if (!res.ok) {
@@ -100,6 +117,7 @@
   }
 
   async function requestWakeLock() {
+    if (wakeLock) return;
     try {
       if ('wakeLock' in navigator && navigator.wakeLock.request) {
         wakeLock = await navigator.wakeLock.request('screen');
@@ -122,7 +140,7 @@
       var remain = hostDeadline - Date.now();
       if (txt) txt.textContent = fmtClock(remain);
       if (ring) {
-        var frac = Math.max(0, remain / (5 * 60 * 1000));
+        var frac = Math.max(0, remain / PIN_MS);
         ring.style.strokeDashoffset = String(CIRC * (1 - frac));
       }
       if (remain <= 0) {
@@ -144,7 +162,8 @@
     extensionsUsed = 0;
     extensionsApplied = 0;
     updateExtendButton();
-    sessionDeadline = Date.now() + 15 * 60 * 1000;
+    sessionFloor = Date.now();
+    sessionDeadline = sessionFloor + SESSION_BASE_MS;
     var label = $('session-timer');
     var wrap = $('session-guard');
     sessionTimer = setInterval(function () {
@@ -173,6 +192,9 @@
   var MAX_EXTENSIONS = 3;
   var MAX_TOTAL_EXTENSIONS = 6;
   var EXTEND_MS = 5 * 60 * 1000;
+  var PIN_MS = 5 * 60 * 1000;
+  var SESSION_BASE_MS = 15 * 60 * 1000;
+  var SESSION_MAX_RUN_MS = SESSION_BASE_MS + MAX_TOTAL_EXTENSIONS * EXTEND_MS;
 
   function updateExtendButton() {
     var btn = $('btn-extend');
@@ -206,7 +228,7 @@
       if (extensionsApplied >= MAX_TOTAL_EXTENSIONS) return;
       extensionsApplied++;
     }
-    sessionDeadline += EXTEND_MS;
+    sessionDeadline = Math.min(sessionDeadline + EXTEND_MS, sessionFloor + SESSION_MAX_RUN_MS);
     sessionExpiring = false;
     var wrap = $('session-guard');
     if (wrap) wrap.classList.remove('expiring');
@@ -259,19 +281,27 @@
       if (pinEl) pinEl.textContent = String(currentPin).split('').join(' ');
       show('view-host');
       startHostCountdown();
+      requestWakeLock();
       try {
         await P2P.createHost(currentPin);
       } catch (e) {
         stopHostCountdown();
-        try { await P2P.disconnect(false); } catch (err) {}
+        releaseWakeLock();
+        var failedPin = currentPin;
         currentPin = null;
         currentRole = null;
         show('view-lobby');
         toast('WebRTC unavailable in this browser');
+        try { await P2P.disconnect(false); } catch (err) {}
+        if (failedPin) await apiCleanup(failedPin);
         return;
       }
       if (tok !== sessionToken) {
+        var stalePin = currentPin;
+        currentPin = null;
+        currentRole = null;
         try { await P2P.disconnect(false); } catch (err) {}
+        if (stalePin) await apiCleanup(stalePin);
         return;
       }
       setConnected(false);
@@ -334,16 +364,36 @@
   var pinBoxesBound = false;
   var lastJoinCode = null;
   var lastJoinAt = 0;
+  function joinBoxes() {
+    return Array.prototype.slice.call(document.querySelectorAll('.pin-box'));
+  }
+
   function clearPinBoxes() {
-    var boxes = document.querySelectorAll('.pin-box');
+    var boxes = joinBoxes();
     boxes.forEach(function (b) { b.value = ''; });
     if (boxes[0]) { try { boxes[0].focus(); } catch (e) {} }
+  }
+
+  function hideJoinError() {
+    var errEl = $('join-error');
+    if (errEl) { errEl.textContent = ''; errEl.classList.add('hidden'); }
+  }
+
+  function showJoinError(msg) {
+    var errEl = $('join-error');
+    if (errEl) {
+      errEl.textContent = msg;
+      errEl.classList.remove('hidden');
+    }
+    var boxes = joinBoxes();
+    boxes.forEach(function (b) { b.value = ''; });
+    if (boxes[0]) boxes[0].focus();
   }
 
   function setupPinBoxes() {
     if (pinBoxesBound) return;
     pinBoxesBound = true;
-    var boxes = Array.prototype.slice.call(document.querySelectorAll('.pin-box'));
+    var boxes = joinBoxes();
     if (boxes.length === 0) return;
     boxes.forEach(function (box, i) {
       box.value = '';
@@ -380,8 +430,7 @@
     if (joining) return;
     joining = true;
     var tok = sessionToken;
-    var errEl = $('join-error');
-    if (errEl) { errEl.textContent = ''; errEl.classList.add('hidden'); }
+    hideJoinError();
     try {
       await api('api.php?action=join', { pin: code });
       if (tok !== sessionToken) return;
@@ -402,11 +451,10 @@
       } catch (e) {
         stopSessionGuard();
         releaseWakeLock();
-        show('view-join');
-        clearPinBoxes();
         currentPin = null;
         currentRole = null;
-        if (errEl) { errEl.textContent = 'WebRTC unavailable in this browser'; errEl.classList.remove('hidden'); }
+        show('view-join');
+        showJoinError('WebRTC unavailable in this browser');
         return;
       }
     } catch (e) {
@@ -418,10 +466,7 @@
       else if (typeof e.data.remaining === 'number' && e.data.remaining > 0) {
         msg = 'Invalid PIN (' + e.data.remaining + ' attempts left)';
       }
-      if (errEl) { errEl.textContent = msg; errEl.classList.remove('hidden'); }
-      var boxes = document.querySelectorAll('.pin-box');
-      boxes.forEach(function (b) { b.value = ''; });
-      if (boxes[0]) boxes[0].focus();
+      showJoinError(msg);
     } finally {
       joining = false;
     }
@@ -536,38 +581,34 @@
     }
   }
 
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+
   function appendTextCard(text, mine) {
     var list = $('text-list');
     if (!list) return;
     var empty = $('text-empty');
     if (empty) empty.remove();
-    var card = document.createElement('div');
-    card.className = 'rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-3 shadow-sm';
-    var head = document.createElement('div');
-    head.className = 'flex items-center justify-between gap-2 mb-1';
-    var meta = document.createElement('div');
-    meta.className = 'text-[11px] uppercase tracking-wide opacity-60';
-    meta.textContent = mine ? 'You' : 'Peer';
-    var btn = document.createElement('button');
-    btn.className = 'shrink-0 text-xs font-semibold px-3 py-1.5 rounded-lg bg-slate-900 text-white dark:bg-white dark:text-slate-900 active:scale-95 transition';
-    btn.textContent = 'Copy';
+    var card = el('div', 'rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-3 shadow-sm');
+    var head = el('div', 'flex items-center justify-between gap-2 mb-1');
+    var meta = el('div', 'text-[11px] uppercase tracking-wide opacity-60', mine ? 'You' : 'Peer');
+    var btn = el('button', 'shrink-0 text-xs font-semibold px-3 py-1.5 rounded-lg bg-slate-900 text-white dark:bg-white dark:text-slate-900 active:scale-95 transition', 'Copy');
     btn.setAttribute('aria-label', 'Copy text');
-    var del = document.createElement('button');
-    del.className = 'shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-lg opacity-50 hover:opacity-100 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-950 active:scale-95 transition';
-    del.textContent = '✕';
+    var del = el('button', 'shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-lg opacity-50 hover:opacity-100 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-950 active:scale-95 transition', '✕');
     del.setAttribute('aria-label', 'Delete message');
     del.addEventListener('click', function () {
       card.remove();
     });
-    var actions = document.createElement('div');
-    actions.className = 'flex items-center gap-1.5';
+    var actions = el('div', 'flex items-center gap-1.5');
     actions.appendChild(btn);
     actions.appendChild(del);
     head.appendChild(meta);
     head.appendChild(actions);
-    var body = document.createElement('div');
-    body.className = 'whitespace-pre-wrap break-words text-sm';
-    body.textContent = text;
+    var body = el('div', 'whitespace-pre-wrap break-words text-sm', text);
     btn.addEventListener('click', async function () {
       var done = await copyText(text);
       btn.textContent = done ? 'Copied!' : 'Copy failed';
@@ -583,21 +624,15 @@
 
   function progressRow(listId, key) {
     var list = $(listId);
-    if (!list) return null;
+    if (!list || typeof key !== 'string' || key === '') return null;
     var row = list.querySelector('[data-tid="' + key + '"]');
     if (row) return row;
-    row = document.createElement('div');
+    row = el('div', 'txrx-row');
     row.setAttribute('data-tid', key);
-    row.className = 'txrx-row';
-    var top = document.createElement('div');
-    top.className = 'txrx-top';
-    var nm = document.createElement('span');
-    nm.className = 'txrx-name';
-    var pc = document.createElement('span');
-    pc.className = 'txrx-pct';
-    var xc = document.createElement('button');
-    xc.className = 'txrx-cancel';
-    xc.textContent = '\u2715';
+    var top = el('div', 'txrx-top');
+    var nm = el('span', 'txrx-name');
+    var pc = el('span', 'txrx-pct');
+    var xc = el('button', 'txrx-cancel', '\u2715');
     xc.setAttribute('aria-label', 'Cancel transfer');
     xc.title = 'Cancel transfer';
     (function (btn, lid, tid) {
@@ -610,18 +645,15 @@
     top.appendChild(nm);
     top.appendChild(pc);
     top.appendChild(xc);
-    var track = document.createElement('div');
-    track.className = 'progress-track h-6 rounded-xl bg-slate-100 dark:bg-slate-800';
-    var fill = document.createElement('div');
-    fill.className = 'progress-fill';
+    var track = el('div', 'progress-track h-6 rounded-xl bg-slate-100 dark:bg-slate-800');
+    var fill = el('div', 'progress-fill');
     fill.style.transform = 'scaleX(0)';
     fill.setAttribute('role', 'progressbar');
     fill.setAttribute('aria-valuemin', '0');
     fill.setAttribute('aria-valuemax', '100');
     fill.setAttribute('aria-valuenow', '0');
     track.appendChild(fill);
-    var meta = document.createElement('div');
-    meta.className = 'txrx-meta';
+    var meta = el('div', 'txrx-meta');
     row.appendChild(top);
     row.appendChild(track);
     row.appendChild(meta);
@@ -748,7 +780,9 @@
       receivedBlobs.forEach(function (f) {
         zip.file(zipSafeName(f.name, used), f.blob);
       });
-      var blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' }, function (meta) {
+      var totalBytes = 0;
+      receivedBlobs.forEach(function (f) { totalBytes += (f.blob && f.blob.size) || 0; });
+      var blob = await zip.generateAsync({ type: 'blob', compression: totalBytes > 104857600 ? 'STORE' : 'DEFLATE' }, function (meta) {
         if (btn) btn.textContent = 'Preparing… ' + Math.round(meta.percent) + '%';
       });
       var stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
@@ -778,36 +812,30 @@
     if (info && info.blob) {
       entry = { name: info.name, blob: info.blob };
       receivedBlobs.push(entry);
+      receivedAggBytes += (info.blob && info.blob.size) || 0;
+      if (receivedAggBytes > 4294967296 && !aggWarned) {
+        aggWarned = true;
+        toast('Heavy receiving session — device memory may strain. Delete received files after saving.');
+      }
       updateZipButton();
     }
     var empty = $('file-empty');
     if (empty) empty.remove();
-    var card = document.createElement('div');
-    card.className = 'rounded-xl border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950 p-3 space-y-2.5';
-    var top = document.createElement('div');
-    top.className = 'flex items-start gap-2.5';
-    var icon = document.createElement('div');
-    icon.className = 'text-2xl leading-none mt-0.5';
-    icon.textContent = '📄';
-    var mid = document.createElement('div');
-    mid.className = 'flex-1 min-w-0';
-    var name = document.createElement('div');
-    name.className = 'font-semibold text-sm break-all';
-    name.textContent = info.name;
+    var card = el('div', 'rounded-xl border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950 p-3 space-y-2.5');
+    var top = el('div', 'flex items-start gap-2.5');
+    var icon = el('div', 'text-2xl leading-none mt-0.5', '📄');
+    var mid = el('div', 'flex-1 min-w-0');
+    var name = el('div', 'font-semibold text-sm break-all', info.name);
     name.title = info.name;
-    var sub = document.createElement('div');
-    sub.className = 'text-xs opacity-70 mt-0.5';
-    sub.textContent = fmtBytes(info.size);
+    var sub = el('div', 'text-xs opacity-70 mt-0.5', fmtBytes(info.size));
     mid.appendChild(name);
     mid.appendChild(sub);
     top.appendChild(icon);
     top.appendChild(mid);
-    var del = document.createElement('button');
-    del.className = 'shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-lg opacity-50 hover:opacity-100 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-950 active:scale-95 transition self-start';
-    del.textContent = '✕';
+    var del = el('button', 'shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-lg opacity-50 hover:opacity-100 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-950 active:scale-95 transition self-start', '\u2715');
     del.setAttribute('aria-label', 'Delete file');
     top.appendChild(del);
-    var link = document.createElement('a');
+    var link = el('a');
     link.href = info.url;
     link.setAttribute('download', info.name);
     link.className = 'block w-full text-center px-4 py-2.5 rounded-xl bg-emerald-600 text-white text-sm font-bold shadow hover:bg-emerald-500 active:scale-[.98] transition break-all';
@@ -818,7 +846,10 @@
       try { URL.revokeObjectURL(link.href); } catch (e) {}
       if (entry) {
         var ix = receivedBlobs.indexOf(entry);
-        if (ix !== -1) receivedBlobs.splice(ix, 1);
+        if (ix !== -1) {
+          receivedBlobs.splice(ix, 1);
+          receivedAggBytes = Math.max(0, receivedAggBytes - ((entry.blob && entry.blob.size) || 0));
+        }
         updateZipButton();
       }
       card.remove();
@@ -865,7 +896,7 @@
         endSession(true);
       }
     } else if (evt.type === 'send-start') {
-      txState[evt.data.transferId] = { sent: 0, size: evt.data.size, name: evt.data.name, elapsed: 0, rate: 0 };
+      txState[evt.data.transferId] = { transferId: evt.data.transferId, sent: 0, size: evt.data.size, name: evt.data.name, elapsed: 0, rate: 0 };
       renderTx(txState[evt.data.transferId]);
     } else if (evt.type === 'send-progress') {
       txState[evt.data.transferId] = evt.data;
@@ -876,7 +907,7 @@
       toast('Sent ' + evt.data.name);
       maybeExpireSession();
     } else if (evt.type === 'recv-start') {
-      rxState[evt.data.transferId] = { received: 0, size: evt.data.size, name: evt.data.name, elapsed: 0, rate: 0 };
+      rxState[evt.data.transferId] = { transferId: evt.data.transferId, received: 0, size: evt.data.size, name: evt.data.name, elapsed: 0, rate: 0 };
       renderRx(rxState[evt.data.transferId]);
     } else if (evt.type === 'recv-progress') {
       rxState[evt.data.transferId] = evt.data;
@@ -942,6 +973,9 @@
         delete rxState[evt.data.transferId];
         toast('Could not assemble file — too large for this device?');
       }
+      if (evt.data.message === 'sdp_too_large') {
+        toast('Signaling payload too large — transfers still work, but reconnect may need a reload');
+      }
     }
   }
 
@@ -972,6 +1006,8 @@
     txRows = Object.create(null);
     rxRows = Object.create(null);
     receivedBlobs = [];
+    receivedAggBytes = 0;
+    aggWarned = false;
     updateZipButton();
     renderTx(null);
     renderRx(null);
@@ -980,7 +1016,11 @@
     setTextExpanded(false);
   }
 
+  var ending = false;
   async function endSession(silent) {
+    if (ending) return;
+    ending = true;
+    try {
     sessionToken++;
     if (debugTimer) {
       clearInterval(debugTimer);
@@ -1001,9 +1041,11 @@
       var defaultTab = $('btn-tab-text');
       if (defaultTab) defaultTab.click();
     } catch (e) {}
-    var boxes = document.querySelectorAll('.pin-box');
-    boxes.forEach(function (b) { b.value = ''; });
+    joinBoxes().forEach(function (b) { b.value = ''; });
     show('view-lobby');
+    } finally {
+      ending = false;
+    }
   }
 
   function initTheme() {
@@ -1156,6 +1198,9 @@
         }).catch(function () {});
       });
       navigator.serviceWorker.addEventListener('message', function (e) {
+        try {
+          if (e.origin !== window.location.origin) return;
+        } catch (err) {}
         if (e.data && e.data.type === 'sw-updated' && navigator.serviceWorker.controller) {
           toast('App updated');
         }
