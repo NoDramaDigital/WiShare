@@ -118,7 +118,7 @@ try {
 <input class="pin-box" inputmode="numeric" maxlength="1" aria-label="Digit 4">
 </div>
 <p id="join-error" class="hidden text-sm font-semibold text-red-500"></p>
-<p class="text-xs opacity-60">Ask the sharing device for its PIN. submits automatically.</p>
+<p class="text-xs opacity-60">Ask the sharing device for its PIN. Submits automatically.</p>
 <button data-back class="btn-ghost">← Back</button>
 </div>
 </section>
