@@ -44,6 +44,7 @@ window.P2P = (function () {
   var lastOfferSent = null;
   var lastAnswerSent = null;
   var closed = false;
+  var sessionGen = 0;
   var failCount = 0;
   var signalGone = false;
   var statSentCands = 0;
@@ -610,6 +611,7 @@ window.P2P = (function () {
   }
 
   function reset() {
+    sessionGen++;
     stopPolling();
     pollStopped = false;
     clearReconnectTimer();
@@ -908,25 +910,30 @@ window.P2P = (function () {
 
   async function disconnect(sendTeardown) {
     if (sendTeardown === undefined) sendTeardown = true;
-    if (sendTeardown && dc && dc.readyState !== 'closed' && dc.readyState !== 'closing') {
+    var myGen = sessionGen;
+    var dc0 = dc;
+    if (sendTeardown && dc0 && dc0.readyState !== 'closed' && dc0.readyState !== 'closing') {
       var openWaited = 0;
-      while (dc.readyState !== 'open' && openWaited < 1000) {
+      while (dc0.readyState !== 'open' && openWaited < 1000) {
         await sleep(50);
         openWaited += 50;
       }
     }
-    if (sendTeardown && sendJson(dc, { type: 'teardown' })) {
+    if (myGen !== sessionGen) return;
+    if (sendTeardown && sendJson(dc0, { type: 'teardown' })) {
       var waited = 0;
-      while (dc.bufferedAmount > 0 && waited < 2000) {
+      while (dc0.bufferedAmount > 0 && waited < 2000) {
         await sleep(50);
         waited += 50;
       }
     }
+    if (myGen !== sessionGen) return;
+    var pc0 = pc;
     closed = true;
     stopPolling();
     stopPing();
     clearReconnectTimer();
-    settleWaiter(dc);
+    settleWaiter(dc0);
     for (var si = 0; si < fileSlots.length; si++) {
       if (fileSlots[si]) settleWaiter(fileSlots[si].ch);
     }
@@ -934,8 +941,8 @@ window.P2P = (function () {
     activeCount = 0;
     activeSends = {};
     incoming = Object.create(null);
-    try { if (dc) dc.close(); } catch (e) {}
-    try { if (pc) pc.close(); } catch (e) {}
+    try { if (dc0) dc0.close(); } catch (e) {}
+    try { if (pc0) pc0.close(); } catch (e) {}
     connectedFlag = false;
     emit('disconnected', {});
   }
