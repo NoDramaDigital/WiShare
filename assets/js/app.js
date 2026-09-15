@@ -1,5 +1,5 @@
 (function () {
-  var APP_VER = 'v46';
+  var APP_VER = 'v47';
   var APP_BUILD = 1;
   function paintDims() {
     try {
@@ -1020,6 +1020,8 @@
   async function endSession(silent) {
     if (ending) return;
     ending = true;
+    var pinToClean = currentPin;
+    var tokAtEntry = sessionToken;
     try {
     sessionToken++;
     if (debugTimer) {
@@ -1032,7 +1034,8 @@
     stopSessionGuard();
     releaseWakeLock();
     try { await P2P.disconnect(!silent); } catch (e) {}
-    if (currentPin) await apiCleanup(currentPin);
+    if (pinToClean) await apiCleanup(pinToClean);
+    if (sessionToken !== tokAtEntry + 1) return;
     currentPin = null;
     currentRole = null;
     clearWorkspace();
