@@ -362,8 +362,15 @@ if ($action === 'create') {
     $fp = @fopen($path, 'x');
     if ($fp === false) jexit(['ok' => false, 'error' => 'pin_collision_retry'], 500);
     @chmod($path, 0600);
-    fwrite($fp, (string)json_encode($session, JSON_UNESCAPED_SLASHES));
+    $written = fwrite($fp, (string)json_encode($session, JSON_UNESCAPED_SLASHES));
+    @fflush($fp);
     fclose($fp);
+    $stored = readSessionLocked($path);
+    if ($written === false || !is_array($stored) || ($stored['pin'] ?? null) !== $pinNew) {
+        @unlink($path);
+        error_log('[wishare] create store_failed pin=' . $pinNew);
+        jexit(['ok' => false, 'error' => 'session_store_failed', 'retry_after' => 30], 500);
+    }
     jexit(['ok' => true, 'pin' => $pinNew, 'created_at' => $now, 'status' => 'waiting']);
 }
 
@@ -374,8 +381,15 @@ if ($action === 'join') {
     requireUnlocked($rate, $ip);
     if (!validPinFormat(is_string($pin) ? $pin : null)) failPin($ip);
     $path = sessionPath((string)$pin);
+    if (!file_exists($path)) {
+        error_log('[wishare] join no_such_session pin=' . (string)$pin);
+        failPin($ip);
+    }
     $s = readSessionLocked($path);
-    if ($s === null) failPin($ip);
+    if ($s === null) {
+        error_log('[wishare] join unreadable pin=' . (string)$pin);
+        failPin($ip);
+    }
     if ((time() - (int)($s['created_at'] ?? 0)) > SESSION_TTL) {
         @unlink($path);
         jexit(['ok' => false, 'error' => 'expired'], 410);
@@ -385,7 +399,10 @@ if ($action === 'join') {
         if (($d['status'] ?? 'waiting') === 'waiting') $d['status'] = 'connecting';
         return $d;
     });
-    if ($updated === null) failPin($ip);
+    if ($updated === null) {
+        error_log('[wishare] join update_failed pin=' . (string)$pin);
+        failPin($ip);
+    }
     clearFails($ip);
     $fresh = readSessionLocked($path);
     jexit(['ok' => true, 'pin' => (string)$pin, 'status' => $fresh['status'] ?? 'connecting']);
