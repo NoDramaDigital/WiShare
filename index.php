@@ -27,7 +27,7 @@ try {
 } catch (e) {}
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="assets/css/custom.css?v=46">
+<link rel="stylesheet" href="assets/css/custom.css?v=47">
 </head>
 <body class="h-svh text-slate-900 dark:text-slate-100 flex flex-col bg-decor">
 <header class="shrink-0 sticky top-0 z-40 border-b border-slate-200/70 dark:border-slate-800/70 bg-white/80 dark:bg-slate-950/80 backdrop-blur px-4 py-3 flex items-center justify-between">
@@ -197,7 +197,7 @@ Ephemeral by design — signaling records self-destruct · payloads never touch 
 
 <div id="toast" class="hidden" role="status" aria-live="polite"></div>
 
-<script src="assets/js/webrtc.js?v=46"></script>
-<script src="assets/js/app.js?v=46"></script>
+<script src="assets/js/webrtc.js?v=47"></script>
+<script src="assets/js/app.js?v=47"></script>
 </body>
 </html>
