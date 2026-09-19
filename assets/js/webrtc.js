@@ -50,6 +50,13 @@ window.P2P = (function () {
   var statSentCands = 0;
   var lastRtt = 0;
   var pingTimer = null;
+  var rxMsgs = 0;
+  var rxBytes = 0;
+  var helloSeen = false;
+  var helloTimer = null;
+  var chanOpenAt = 0;
+  var lastPongAt = 0;
+  var linkSilentFired = false;
   var lastSendEmit = 0;
   var loopSum = 0;
   var loopN = 0;
@@ -332,11 +339,20 @@ window.P2P = (function () {
     ch.onopen = function () {
       emit('channel-open', {});
       startPing();
+      sendJson(ch, { type: 'hello', ver: PROTO_VER });
+      helloSeen = false;
+      chanOpenAt = Date.now();
+      linkSilentFired = false;
+      if (helloTimer) clearTimeout(helloTimer);
+      helloTimer = setTimeout(function () {
+        if (!helloSeen && !closed) emit('peer-legacy', {});
+      }, 12000);
       dispatchQueue();
     };
     ch.onclose = function () {
       emit('channel-close', {});
       stopPing();
+      if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
       if (ch._resumeSend) {
         var r = ch._resumeSend;
         ch._resumeSend = null;
@@ -428,6 +444,8 @@ window.P2P = (function () {
 
   async function handleMessage(e, ch) {
     var now = Date.now();
+    rxMsgs++;
+    try { rxBytes += (typeof e.data === 'string') ? e.data.length : ((e.data && (e.data.byteLength || e.data.size)) || 0); } catch (e) {}
     if (typeof e.data === 'string') {
       var msg;
       try { msg = JSON.parse(e.data); } catch (err) { return; }
@@ -436,10 +454,7 @@ window.P2P = (function () {
         if (typeof msg.size !== 'number' || !(msg.size >= 0) || msg.size > 21474836480) return;
         if (typeof msg.totalChunks !== 'number' || (msg.totalChunks | 0) !== msg.totalChunks) return;
         if (typeof msg.name !== 'string' || msg.name === '' || msg.name.length > 255) return;
-        var cs = CHUNK_SIZE;
-        if (typeof msg.chunkSize === 'number' && (msg.chunkSize | 0) === msg.chunkSize && msg.chunkSize >= 4096 && msg.chunkSize <= 1048576) cs = msg.chunkSize;
-        var expect = Math.max(1, Math.ceil(msg.size / cs));
-        if (msg.totalChunks !== expect || msg.totalChunks > 350000) return;
+        if (msg.totalChunks < 1 || msg.totalChunks > 350000) return;
         if (ch) ch._transferId = msg.transferId;
         var inFlight = 0;
         for (var tId in incoming) {
@@ -508,9 +523,14 @@ window.P2P = (function () {
       } else if (msg.type === 'extend') {
         var mins = (typeof msg.minutes === 'number' && msg.minutes > 0 && msg.minutes <= 30) ? msg.minutes : 5;
         emit('extend-received', { minutes: mins });
+      } else if (msg.type === 'hello') {
+        helloSeen = true;
+        if (typeof msg.ver === 'number' && msg.ver !== PROTO_VER) emit('peer-mismatch', { ver: msg.ver });
       } else if (msg.type === 'ping' && typeof msg.t === 'number') {
         sendJson(dc, { type: 'pong', t: msg.t });
       } else if (msg.type === 'pong' && typeof msg.t === 'number') {
+        lastPongAt = Date.now();
+        linkSilentFired = false;
         var rtt = Date.now() - msg.t;
         if (rtt >= 0 && rtt < 60000) lastRtt = rtt;
       } else if (msg.type === 'received' && typeof msg.transferId === 'string') {
@@ -596,7 +616,14 @@ window.P2P = (function () {
     stopPing();
     pingTimer = setInterval(function () {
       if (closed || !dc || dc.readyState !== 'open') return;
+      sendJson(dc, { type: 'hello', ver: PROTO_VER });
       sendJson(dc, { type: 'ping', t: Date.now() });
+      if (!linkSilentFired && chanOpenAt && Date.now() - chanOpenAt > 10000) {
+        if (!lastPongAt || Date.now() - lastPongAt > 15000) {
+          linkSilentFired = true;
+          emit('link-silent', {});
+        }
+      }
     }, PING_MS);
   }
 
@@ -612,6 +639,13 @@ window.P2P = (function () {
 
   function reset() {
     sessionGen++;
+    if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
+    helloSeen = false;
+    chanOpenAt = 0;
+    lastPongAt = 0;
+    linkSilentFired = false;
+    rxMsgs = 0;
+    rxBytes = 0;
     stopPolling();
     pollStopped = false;
     clearReconnectTimer();
@@ -931,6 +965,7 @@ window.P2P = (function () {
     var pc0 = pc;
     closed = true;
     stopPolling();
+    if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
     stopPing();
     clearReconnectTimer();
     settleWaiter(dc0);
@@ -982,6 +1017,7 @@ window.P2P = (function () {
       sig: signalGone ? 'gone' : 'live',
       fast: peerNew,
       rtt: lastRtt,
+      rx: rxMsgs,
       loopMs: loopN ? Math.round((loopSum / loopN) * 100) / 100 : 0,
       maxMsg: (pc && pc.sctp) ? pc.sctp.maxMessageSize : 0,
       fails: failCount,
