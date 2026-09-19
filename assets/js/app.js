@@ -1,5 +1,5 @@
 (function () {
-  var APP_VER = 'v47';
+  var APP_VER = 'v48';
   var APP_BUILD = 1;
   function paintDims() {
     try {
@@ -934,6 +934,10 @@
       playIncoming();
     } else if (evt.type === 'extend-received') {
       extendSession(true);
+    } else if (evt.type === 'peer-legacy' || evt.type === 'peer-mismatch') {
+      toast('Peer runs a different version — reload both devices, then rejoin');
+    } else if (evt.type === 'link-silent') {
+      toast('Data link silent — keep the other tab open and foregrounded');
     } else if (evt.type === 'recv-aborted') {
       dropRow('rx-list', rxRows, evt.data.transferId, false);
       delete rxState[evt.data.transferId];
@@ -975,6 +979,9 @@
       }
       if (evt.data.message === 'sdp_too_large') {
         toast('Signaling payload too large — transfers still work, but reconnect may need a reload');
+      }
+      if (evt.data.message === 'incoming-over-budget') {
+        toast('Receiver is full — delete received files, then ask sender to retry ' + (evt.data.name || 'file'));
       }
     }
   }
@@ -1095,7 +1102,7 @@
     try {
       var d = window.P2P ? P2P.debug() : null;
       line.textContent = d
-        ? 'ice:' + d.ice + ' conn:' + d.conn + ' dc:' + d.dc + ' sig:' + d.sig + ' fails:' + d.fails + ' cands:' + d.sentCands + '↑/' + d.gotCands + '↓' + ' loop:' + d.loopMs + 'ms max:' + d.maxMsg + ' rtt:' + d.rtt + 'ms'
+        ? 'ice:' + d.ice + ' conn:' + d.conn + ' dc:' + d.dc + ' sig:' + d.sig + ' fails:' + d.fails + ' cands:' + d.sentCands + '↑/' + d.gotCands + '↓' + ' loop:' + d.loopMs + 'ms max:' + d.maxMsg + ' rtt:' + d.rtt + 'ms rx:' + d.rx
         : 'engine missing';
     } catch (e) {
       line.textContent = 'n/a';
